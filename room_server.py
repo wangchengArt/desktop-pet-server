@@ -179,13 +179,19 @@ async def on_bubble(ws_id: str, msg: dict):
 
 # ── 连接主处理器 ──────────────────────────────────────────
 HANDLERS = {
-    "create_room":  on_create,
-    "join_room":    on_join,
-    "leave_room":   lambda ws_id, _: on_leave(ws_id),
-    "sync":         on_sync,
-    "pvp_move":     on_pvp_move,
-    "game_invite":  on_game_invite,
-    "bubble":       on_bubble,
+    "create_room":   on_create,
+    "join_room":     on_join,
+    "leave_room":    lambda ws_id, _: on_leave(ws_id),
+    "sync":          on_sync,
+    "pvp_move":      on_pvp_move,
+    "game_invite":   on_game_invite,
+    "bubble":        on_bubble,
+    # 对战邀请应答 —— 透明转发
+    "pvp_accept":    lambda ws_id, msg: broadcast_peer(
+                         ws_id, pack(type="pvp_accept",
+                                     **{k:v for k,v in msg.items() if k!="type"})),
+    "pvp_decline":   lambda ws_id, msg: broadcast_peer(
+                         ws_id, pack(type="pvp_decline")),
 }
 
 async def handle(ws: WebSocketServerProtocol, path: str = "/"):
