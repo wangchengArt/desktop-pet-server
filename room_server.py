@@ -233,6 +233,7 @@ HANDLERS = {
     "sync_upload":   lambda ws_id, msg: on_sync_upload(ws_id, msg),
     "sync_download": lambda ws_id, msg: on_sync_download(ws_id, msg),
     "check_name":    lambda ws_id, msg: on_check_name(ws_id, msg),
+    "login_user":    lambda ws_id, msg: on_login_user(ws_id, msg),
     "register_user": lambda ws_id, msg: on_register_user(ws_id, msg),
     "gm_search":     lambda ws_id, msg: on_gm_search(ws_id, msg),
     "gm_give":       lambda ws_id, msg: on_gm_give(ws_id, msg),
@@ -360,6 +361,29 @@ async def on_check_name(ws_id: str, msg: dict):
         return
     exists = os.path.exists(_reg_path(name))
     await send(ws_id, pack(type="check_name_result", exists=exists))
+
+async def on_login_user(ws_id: str, msg: dict):
+    """验证登录：检查名字和密码是否匹配"""
+    name = msg.get("name", "").strip()
+    pwd = msg.get("password", "")
+    if not name:
+        await send(ws_id, pack(type="login_result", ok=False, msg="名字不能为空"))
+        return
+    path = _reg_path(name)
+    if not os.path.exists(path):
+        await send(ws_id, pack(type="login_result", ok=False, msg="账号不存在"))
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("password", "") != pwd:
+            await send(ws_id, pack(type="login_result", ok=False, msg="密码错误"))
+            return
+        await send(ws_id, pack(type="login_result", ok=True,
+                               user_id=data.get("user_id", ""),
+                               name=data.get("name", name)))
+    except Exception as e:
+        await send(ws_id, pack(type="login_result", ok=False, msg=f"登录失败: {e}"))
 
 async def on_register_user(ws_id: str, msg: dict):
     name = msg.get("name", "").strip()
