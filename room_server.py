@@ -362,28 +362,53 @@ async def on_check_name(ws_id: str, msg: dict):
     exists = os.path.exists(_reg_path(name))
     await send(ws_id, pack(type="check_name_result", exists=exists))
 
+def _find_by_uid(uid: str) -> dict | None:
+    """通过 user_id 查找注册信息"""
+    if not os.path.isdir(REGISTER_DIR):
+        return None
+    for fn in os.listdir(REGISTER_DIR):
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(REGISTER_DIR, fn), encoding="utf-8") as f:
+                data = json.load(f)
+            if str(data.get("user_id", "")) == str(uid):
+                return data
+        except Exception:
+            continue
+    return None
+
 async def on_login_user(ws_id: str, msg: dict):
-    """验证登录：检查名字和密码是否匹配"""
+    """验证登录：支持名字或8位ID + 密码"""
     name = msg.get("name", "").strip()
+    uid = msg.get("user_id", "").strip()
     pwd = msg.get("password", "")
-    if not name:
-        await send(ws_id, pack(type="login_result", ok=False, msg="名字不能为空"))
+
+    if not name and not uid:
+        await send(ws_id, pack(type="login_result", ok=False, msg="请输入名字或ID"))
         return
-    path = _reg_path(name)
-    if not os.path.exists(path):
+
+    data = None
+    if uid:
+        data = _find_by_uid(uid)
+    if not data and name:
+        path = _reg_path(name)
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+
+    if not data:
         await send(ws_id, pack(type="login_result", ok=False, msg="账号不存在"))
         return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if data.get("password", "") != pwd:
-            await send(ws_id, pack(type="login_result", ok=False, msg="密码错误"))
-            return
-        await send(ws_id, pack(type="login_result", ok=True,
-                               user_id=data.get("user_id", ""),
-                               name=data.get("name", name)))
-    except Exception as e:
-        await send(ws_id, pack(type="login_result", ok=False, msg=f"登录失败: {e}"))
+    if data.get("password", "") != pwd:
+        await send(ws_id, pack(type="login_result", ok=False, msg="密码错误"))
+        return
+    await send(ws_id, pack(type="login_result", ok=True,
+                           user_id=data.get("user_id", ""),
+                           name=data.get("name", name)))
 
 async def on_register_user(ws_id: str, msg: dict):
     name = msg.get("name", "").strip()
