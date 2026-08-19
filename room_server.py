@@ -33,6 +33,7 @@ GEN_MAX_RETRY = 100             # 房间码生成最大重试
 # ── 全局状态 ──────────────────────────────────────────────
 rooms: dict[str, dict] = {}
 conns: dict[str, dict] = {}
+battles: dict[str, str] = {}   # 对战中的玩家 ws_id → 对手 ws_id
 
 # ── 随机匹配队列 ─────────────────────────────────────────
 match_queues: dict[str, list] = {}   # {game_type: [ws_id, ...]}
@@ -61,13 +62,71 @@ def _save_path(token: str) -> str:
     safe = "".join(c for c in token if c.isalnum())[:32] or "default"
     return os.path.join(SAVE_DIR, f"{safe}.json")
 
-def cloud_save(token: str, data: dict):
-    data["_ts"] = time.time()
+
+# ── 金币异常增长检测 ──
+COIN_SINGLE_GAIN_MAX = int(os.environ.get("COIN_SINGLE_GAIN_MAX", 20_000_000))  # 单次上传增量上限
+COIN_DAILY_GAIN_MAX  = int(os.environ.get("COIN_DAILY_GAIN_MAX", 50_000_000))   # 每日净增长上限
+COIN_LARGE_GAIN      = int(os.environ.get("COIN_LARGE_GAIN", 500_000))          # 单次大额增长阈值
+COIN_DAILY_LARGE_COUNT = int(os.environ.get("COIN_DAILY_LARGE_COUNT", 10))      # 每日大额增长次数上限
+
+
+def _audit_path(token: str) -> str:
+    safe = "".join(c for c in token if c.isalnum())[:32] or "default"
+    return os.path.join(SAVE_DIR, f"{safe}.audit.json")
+
+
+def _load_coin_audit(token: str) -> dict:
+    try:
+        with open(_audit_path(token), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_coin_audit(token: str, audit: dict):
+    try:
+        with open(_audit_path(token), "w", encoding="utf-8") as f:
+            json.dump(audit, f)
+    except Exception:
+        pass
+
+
+def cloud_save(token: str, data: dict, skip_check: bool = False) -> bool:
+    """保存存档，带金币异常增长检测；返回是否成功保存"""
+    new_coins = int(data.get("coins", 0) or 0)
+    old = cloud_load(token)
+    old_coins = int(old.get("coins", 0) or 0)
+    delta = new_coins - old_coins
+    now = time.time()
+
+    # 每日净增长检测（只累计正增长；GM 发金币时跳过检测、不累计）
+    today = time.strftime("%Y%m%d")
+    audit = _load_coin_audit(token)
+    if audit.get("date") != today:
+        audit = {"date": today, "daily_gain": 0, "large_count": 0}
+
+    if not skip_check:
+        daily_gain = audit.get("daily_gain", 0) + max(0, delta)
+        large_count = audit.get("large_count", 0)
+        if delta > COIN_LARGE_GAIN:
+            large_count += 1
+        # 异常：单次暴增 / 每日净增长超限 / 大额增长次数超限 → 拒绝保存
+        if (delta > COIN_SINGLE_GAIN_MAX or daily_gain > COIN_DAILY_GAIN_MAX
+                or large_count > COIN_DAILY_LARGE_COUNT):
+            print(f"[!] 金币异常：{token} 单次+{delta} 今日净增+{daily_gain} 大额{large_count}次，拒绝保存")
+            return False
+        audit["daily_gain"] = daily_gain
+        audit["large_count"] = large_count
+        _save_coin_audit(token, audit)
+
+    data["_ts"] = now
     try:
         with open(_save_path(token), "w", encoding="utf-8") as f:
             json.dump(data, f)
     except Exception:
-        pass
+        return False
+    return True
+
 
 def cloud_load(token: str) -> dict:
     try:
@@ -282,6 +341,7 @@ async def on_leave(ws_id: str):
         return
     role = c["role"]
     c["room"] = None; c["role"] = None
+    _clear_battle(ws_id)
 
     # 从成员列表移除
     room["members"] = [m for m in room["members"] if m["ws_id"] != ws_id]
@@ -292,7 +352,14 @@ async def on_leave(ws_id: str):
         print(f"[-] 房间 {code} 解散（无成员）")
         return
 
-    # 通知其他人
+    if role == "host":
+        # 房主解散：通知所有剩余成员退出，删除房间
+        await broadcast_to_room_all(code, pack(type="room_disbanded"))
+        del rooms[code]
+        print(f"[-] 房主解散房间 {code}（通知{len(room['members'])}人退出）")
+        return
+
+    # 普通成员离开：通知其他人
     await broadcast_to_room_all(code, pack(type="member_left", ws_id=ws_id,
         members=room["members"]))
     print(f"[-] {ws_id}({role}) 离开房间 {code}（剩{len(room['members'])}人）")
@@ -310,10 +377,37 @@ async def on_sync(ws_id: str, msg: dict):
     await broadcast_to_room(ws_id, pack(type="remote_sync", **payload))
 
 
+def _clear_battle(ws_id: str):
+    """清除某个玩家的对战状态"""
+    opp = battles.pop(ws_id, None)
+    if opp:
+        battles.pop(opp, None)
+
+
+def _battle_over(card: str, game: str) -> bool:
+    """判断 pvp_move 是否表示对战结束"""
+    if card in ("forfeit:", "battle_end"):
+        return True
+    if game == "weak" and card.startswith("end:"):
+        parts = card.split(":")
+        if len(parts) >= 4:
+            try:
+                return int(parts[3]) != 0  # winner != 0 表示已分胜负
+            except ValueError:
+                return False
+    return False
+
+
 async def on_pvp_move(ws_id: str, msg: dict):
-    payload = {k: v for k, v in msg.items() if k != "type"}
+    target = msg.get("target_ws_id", "")
+    if _battle_over(msg.get("card", ""), msg.get("game", "")):
+        _clear_battle(ws_id)
+    payload = {k: v for k, v in msg.items() if k not in ("type", "target_ws_id")}
     payload["from_ws_id"] = ws_id
-    await broadcast_to_room(ws_id, pack(type="pvp_move", **payload))
+    if target:
+        await send(target, pack(type="pvp_move", **payload))
+    else:
+        await broadcast_to_room(ws_id, pack(type="pvp_move", **payload))
 
 
 async def on_game_invite(ws_id: str, msg: dict):
@@ -321,6 +415,9 @@ async def on_game_invite(ws_id: str, msg: dict):
     payload = {k: v for k, v in msg.items() if k != "type"}
     payload["from_ws_id"] = ws_id
     if target_id:
+        if target_id in battles:
+            await send(ws_id, error("对方正在对战"))
+            return
         await send(target_id, pack(type="game_invite", **payload))
     else:
         await broadcast_to_room(ws_id, pack(type="game_invite", **payload))
@@ -337,6 +434,8 @@ async def on_pvp_accept(ws_id: str, msg: dict):
     payload = {k: v for k, v in msg.items() if k not in ("type", "target_ws_id")}
     payload["from_ws_id"] = ws_id
     if target:
+        battles[ws_id] = target
+        battles[target] = ws_id
         await send(target, pack(type="pvp_accept", **payload))
     else:
         await broadcast_to_room(ws_id, pack(type="pvp_accept", **payload))
@@ -453,7 +552,9 @@ async def on_sync_upload(ws_id: str, msg: dict):
     if not _is_authenticated(ws_id, pid):
         await send(ws_id, error("云存档未认证，请先登录"))
         return
-    cloud_save(pid, msg.get("data", {}))
+    if not cloud_save(pid, msg.get("data", {})):
+        await send(ws_id, error("金币增长异常，存档未保存"))
+        return
     await send(ws_id, pack(type="sync_uploaded", ts=time.time()))
 
 async def on_sync_download(ws_id: str, msg: dict):
@@ -804,7 +905,7 @@ async def on_gm_give(ws_id: str, msg: dict):
         save["owned_items"] = ",".join(owned_list)
         detail = f"获得物品 {item_id}"
 
-    cloud_save(pid, save)
+    cloud_save(pid, save, skip_check=True)
 
     if pid in player_registry:
         pw_id = player_registry[pid]
@@ -861,6 +962,7 @@ async def handle(ws: WebSocketServerProtocol, path: str = "/"):
         pass
     finally:
         await on_leave(ws_id)
+        _clear_battle(ws_id)
         # 清理匹配队列状态
         game = match_ctx.pop(ws_id, None)
         if game and ws_id in match_queues.get(game, []):
