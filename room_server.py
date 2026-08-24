@@ -414,6 +414,10 @@ async def on_game_invite(ws_id: str, msg: dict):
     target_id = msg.get("target_ws_id", "")
     payload = {k: v for k, v in msg.items() if k != "type"}
     payload["from_ws_id"] = ws_id
+    # 自己正在对战中 → 不能再邀请别人
+    if ws_id in battles:
+        await send(ws_id, error("你正在对战中，无法发起邀请"))
+        return
     if target_id:
         if target_id in battles:
             await send(ws_id, error("对方正在对战"))
