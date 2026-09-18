@@ -12,13 +12,35 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
+import socket
 import sys
 import time
 
 import websockets
 from websockets.server import WebSocketServerProtocol
+
+# ── 日志降噪（重要）────────────────────────────────────────
+# 服务开在公网，8765 端口会被全世界的扫描器/爬虫持续探测。每一次非 WebSocket
+# 的连接（扫描器发几字节就断）都会让 websockets 打一整段 traceback：
+#
+#     opening handshake failed
+#     EOFError: stream ends after 31 bytes, before end of line
+#     ...（约 45 行）
+#
+# 实测线上日志被刷到 **225 万行 / 119MB**，约 5 万次失败握手。
+# 致命之处在于 StandardError 是**同步写盘**、跑在事件循环线程上 ——
+# 扫描高峰每秒几十次失败 → 每秒写几千行 → **事件循环被写盘卡住** →
+# 正常玩家的心跳（20s PING/PONG）超时 → 服务端主动断开。
+# 表现就是「服务器的连接每隔一段时间就断，重启一下又好」。
+#
+# 压到 CRITICAL：握手失败对我们是纯噪声（不是我们的 bug，也无需处理）。
+# 真正的服务端异常仍会以 CRITICAL 或未捕获异常的形式暴露出来。
+logging.getLogger("websockets").setLevel(logging.CRITICAL)
+logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
+logging.getLogger("websockets.asyncio").setLevel(logging.CRITICAL)
 
 # ── 配置 ────────────────────────────────────────────────────
 AUTH_TOKEN   = os.environ.get("AUTH_TOKEN", "").strip()
@@ -983,23 +1005,62 @@ async def handle(ws: WebSocketServerProtocol, path: str = "/"):
 
 # ── 空闲房间清理 ──────────────────────────────────────────
 async def cleaner():
+    """周期清理：过期会话文件 + 超时空闲房间。
+
+    ⚠️ 整轮必须包在 try 里。原来没有保护 —— 里面任何一处抛异常都会让这个
+    `while True` 协程**永久死掉**（房间不再回收、会话不再清理），
+    异常还会向上冒到 main() 的 `async with` 把服务一起带走。
+    周期性任务"死一次就再也不跑"是最难查的一类故障：进程还活着、CPU 也正常。
+    """
     while True:
         await asyncio.sleep(60)
-        clean_sessions()
-        now = time.time()
-        expired = [c for c, r in rooms.items()
-                   if now - r["last_active"] > ROOM_TIMEOUT]
-        for code in expired:
-            room = rooms.pop(code, None)
-            if not room:
-                continue
-            for m in room.get("members", []):
-                ws_id = m.get("ws_id")
-                if ws_id and ws_id in conns:
-                    await send(ws_id, pack(type="room_timeout"))
-                    conns[ws_id]["room"] = None
-                    conns[ws_id]["role"] = None
-            print(f"[!] 房间 {code} 超时清理")
+        try:
+            clean_sessions()
+            now = time.time()
+            expired = [c for c, r in rooms.items()
+                       if now - r["last_active"] > ROOM_TIMEOUT]
+            for code in expired:
+                room = rooms.pop(code, None)
+                if not room:
+                    continue
+                for m in room.get("members", []):
+                    ws_id = m.get("ws_id")
+                    if ws_id and ws_id in conns:
+                        await send(ws_id, pack(type="room_timeout"))
+                        conns[ws_id]["room"] = None
+                        conns[ws_id]["role"] = None
+                print(f"[!] 房间 {code} 超时清理", flush=True)
+        except Exception as e:
+            # 不 raise：单轮失败不该终结整个清理任务
+            print(f"[!] cleaner 本轮异常（跳过，下轮继续）: {type(e).__name__}: {e}",
+                  flush=True)
+
+
+async def watchdog_feeder():
+    """给 systemd 看门狗喂狗（unit 里配了 WatchdogSec 才生效）。
+
+    为什么需要：如果事件循环卡死，进程**还活着**但不再响应任何连接 ——
+    这时 systemd 的 `Restart=always` 完全不起作用（它只在进程退出时重启），
+    表现就是"服务器断联，手动重启一下才好"。
+
+    这个协程跑在**同一个事件循环**上：循环一卡，喂狗自然停止，
+    systemd 就会按 WatchdogSec 把它杀掉重启。服务健康时它永远不触发。
+    """
+    sock_path = os.environ.get("NOTIFY_SOCKET", "")
+    if not sock_path:
+        return          # 没配 watchdog 就静默跳过，不影响本地/容器运行
+    print("[*] systemd 看门狗已启用", flush=True)
+    while True:
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            try:
+                s.connect(sock_path)
+                s.send(b"WATCHDOG=1")
+            finally:
+                s.close()
+        except Exception:
+            pass
+        await asyncio.sleep(20)     # 必须小于 WatchdogSec
 
 
 # ── 启动 ──────────────────────────────────────────────────
@@ -1018,7 +1079,9 @@ async def main():
     print("-" * 40)
 
     async with websockets.serve(handle, "0.0.0.0", port):
-        await cleaner()
+        # cleaner 与 watchdog 都跑在同一个事件循环上：
+        # 循环一卡，喂狗停止 → systemd 按 WatchdogSec 杀掉重启
+        await asyncio.gather(cleaner(), watchdog_feeder())
 
 
 if __name__ == "__main__":
