@@ -1078,10 +1078,33 @@ async def main():
         print(f"GM 已禁用（未设置 GM_SECRET 环境变量）")
     print("-" * 40)
 
-    async with websockets.serve(handle, "0.0.0.0", port):
-        # cleaner 与 watchdog 都跑在同一个事件循环上：
-        # 循环一卡，喂狗停止 → systemd 按 WatchdogSec 杀掉重启
-        await asyncio.gather(cleaner(), watchdog_feeder())
+    # ── 起服务（绑定失败要重试）────────────────────────────
+    # 旧实例刚退出时端口未必立刻释放（TIME_WAIT / 信号被延迟处理），
+    # 这时直接 bind 会抛 OSError 98 秒退，systemd 每 RestartSec=5 拉起一次、
+    # 每次秒退 → 刷屏式崩溃循环，而且会连带把「谁在占端口」这件事藏起来。
+    # 实测线上曾因此崩了 67 次（MainPID 变成 0，systemd 失去跟踪，
+    # 而端口被一个不受管的遗留进程顶着 → 表现为「服务时好时坏」）。
+    # 退避重试就能扛过那几秒；真的被别人长期占用时，最后一次仍然会抛出，
+    # 只是这时候日志里已经有足够线索了。
+    #
+    # ⚠️ errno 必须同时认 Linux 和 Windows：Linux 是 98(EADDRINUSE)，
+    #    Windows 是 10048(WSAEADDRINUSE)。只判 98 的话补丁在 Windows 上等于没写
+    #    ——本地一测就发现直接 re-raise 了。
+    EADDRINUSE = (98, 10048)
+    for attempt in range(6):
+        try:
+            async with websockets.serve(handle, "0.0.0.0", port):
+                # cleaner 与 watchdog 都跑在同一个事件循环上：
+                # 循环一卡，喂狗停止 → systemd 按 WatchdogSec 杀掉重启
+                await asyncio.gather(cleaner(), watchdog_feeder())
+            return
+        except OSError as e:
+            if e.errno not in EADDRINUSE or attempt == 5:
+                raise
+            print(f"[!] 端口 {port} 被占用，2 秒后重试（{attempt + 1}/6）"
+                  f" —— 若反复出现，用 `ss -lptn 'sport = :{port}'` 查占用者",
+                  flush=True)
+            await asyncio.sleep(2)
 
 
 if __name__ == "__main__":
