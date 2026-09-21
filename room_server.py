@@ -58,6 +58,8 @@ conns: dict[str, dict] = {}
 battles: dict[str, str] = {}   # 对战中的玩家 ws_id → 对手 ws_id
 
 # ── 随机匹配队列 ─────────────────────────────────────────
+# 真人对战只做弱鸡对决，匹配队列固定用这一个 key（见 on_match_request）。
+MATCH_GAME = "weak"
 match_queues: dict[str, list] = {}   # {game_type: [ws_id, ...]}
 match_pets: dict[str, dict] = {}     # {ws_id: pet_info} 排队中的宠物信息
 match_ctx: dict[str, str] = {}       # {ws_id: game_type} 排队状态
@@ -477,8 +479,15 @@ async def on_pvp_decline(ws_id: str, msg: dict):
 
 # ── 随机匹配 ──────────────────────────────────────────────
 async def on_match_request(ws_id: str, msg: dict):
-    """加入匹配队列，若已有同类型等待者则配对"""
-    game = msg.get("game", "weak")
+    """加入匹配队列，若已有同类型等待者则配对
+
+    ⚠️ `game` **一律强制为弱鸡对决，不接受客户端指定**。
+    队列是按 game 分桶的，放任客户端自报 game 会把玩家池静默拆开：
+    报 "rps" 的人只会和同样报 "rps" 的人配对，而客户端本来就只有弱鸡这一个
+    匹配入口 —— 结果是双方各自排队、谁也等不到人，还看不出是坏了。
+    真人对战目前只做弱鸡对决，所以这里不需要那个自由度。
+    """
+    game = MATCH_GAME
     pet = msg.get("pet", {})
     if ws_id in match_ctx:
         return  # 已在匹配中
