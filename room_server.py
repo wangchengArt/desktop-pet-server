@@ -799,13 +799,101 @@ async def on_change_password(ws_id: str, msg: dict):
 def _gm_auth_check(msg: dict) -> bool:
     """GM 认证：未配置 GM_SECRET 时一律拒绝，配置后常量时间比对
 
-    ⚠️ 新代码请用 `_gm_auth_fail(msg)` —— 它能区分「没配」和「填错」。
-    这个布尔版留着是因为其它地方还有引用，但用它就只能回一句笼统的失败。
+    ⚠️ 新代码请用 `_gm_auth_fail(msg, ws_id)` —— 它能区分「没配」和「填错」，
+    而且**带失败限流**。这个布尔版不带限流，别在新代码里用。
     """
     return not _gm_auth_fail(msg)
 
 
-def _gm_auth_fail(msg: dict) -> str:
+# ── GM 认证失败限流 ────────────────────────────────────────
+# 为什么必须有（2026-09-28）：GM 接口原先**没有任何频率限制** —— 失败多少次
+# 都不拦。而密钥是 6 位纯数字（100 万种组合），按 100 次/秒算 ≈ 2.8 小时就能
+# 爆破完，拿到之后可以给任意玩家发任意物品/金币、拉全服玩家名单。
+# 限流之后这条路才堵上；否则弱密钥等于没设。
+#
+# 三个参数都可用环境变量调，不用改代码重启：
+#   GM_FAIL_WINDOW  统计窗口（秒，默认 60）
+#   GM_FAIL_MAX     窗口内允许的失败次数（默认 5）
+#   GM_FAIL_BLOCK   超限后封禁多久（秒，默认 300）
+GM_FAIL_WINDOW = int(os.environ.get("GM_FAIL_WINDOW", 60))
+GM_FAIL_MAX    = int(os.environ.get("GM_FAIL_MAX", 5))
+GM_FAIL_BLOCK  = int(os.environ.get("GM_FAIL_BLOCK", 300))
+
+_gm_fails: dict[str, list] = {}     # ip → 窗口内的失败时间戳
+_gm_blocked: dict[str, float] = {}  # ip → 解封时刻
+
+
+def _gm_client_ip(ws_id: str) -> str:
+    """取连接的来源 IP；拿不到就退化成 ws_id。
+
+    退化成 ws_id 也能用（按连接限流），只是攻击者重连就能绕过 ——
+    但拿得到 IP 是常态，退化分支只是兜底。
+    """
+    try:
+        ws = conns.get(ws_id, {}).get("ws")
+        addr = getattr(ws, "remote_address", None)
+        return (addr[0] if addr else "") or ws_id
+    except Exception:
+        return ws_id
+
+
+def _gm_block_remaining(ip: str) -> int:
+    """还被封着就返回剩余秒数，否则 0（顺便清掉已过期的封禁）"""
+    until = _gm_blocked.get(ip, 0)
+    now = time.time()
+    if until > now:
+        return int(until - now) + 1
+    if until:
+        _gm_blocked.pop(ip, None)
+    return 0
+
+
+def _gm_note_fail(ip: str) -> int:
+    """记一次失败。返回**本次是否触发了封禁**（触发了就返回封禁秒数，否则 0）。
+
+    返回而不是返回 None，是为了让「触发封禁的那一次请求」就能立刻回
+    「次数过多」—— 否则状态在这一次变了、提示却要等下一次才出现。
+    """
+    now = time.time()
+    lst = [t for t in _gm_fails.get(ip, []) if t > now - GM_FAIL_WINDOW]
+    lst.append(now)
+    blocked = 0
+    if len(lst) >= GM_FAIL_MAX:
+        _gm_blocked[ip] = now + GM_FAIL_BLOCK
+        lst = []
+        blocked = GM_FAIL_BLOCK
+        print(f"[!] GM 认证窗口内失败 {GM_FAIL_MAX} 次，封禁 {ip} {GM_FAIL_BLOCK}s", flush=True)
+    _gm_fails[ip] = lst
+    return blocked
+
+
+def _gm_note_ok(ip: str) -> None:
+    """认证成功就清账 —— 免得手滑几次之后，改对了还被自己之前的失败封着"""
+    _gm_fails.pop(ip, None)
+    _gm_blocked.pop(ip, None)
+
+
+def _gm_prune_rate_limit() -> int:
+    """清掉过期的失败记录与封禁（由 cleaner 每分钟调一次），返回清掉的条数。
+
+    为什么要清：这两个字典按 IP 建键，扫端口/爆破的人会不断换 IP，
+    不清就是一条缓慢的内存泄漏。
+    """
+    now = time.time()
+    n = 0
+    for ip in list(_gm_fails):
+        kept = [t for t in _gm_fails[ip] if t > now - GM_FAIL_WINDOW]
+        if kept:
+            _gm_fails[ip] = kept
+        else:
+            _gm_fails.pop(ip, None); n += 1
+    for ip in list(_gm_blocked):
+        if _gm_blocked[ip] <= now:
+            _gm_blocked.pop(ip, None); n += 1
+    return n
+
+
+def _gm_auth_fail(msg: dict, ws_id: str = "") -> str:
     """**空串 = 通过**；否则返回该回给客户端的原因。
 
     为什么要区分（2026-09-28）：两种失败的原因完全不同，但原先都回
@@ -815,10 +903,23 @@ def _gm_auth_fail(msg: dict) -> str:
     「未配置」这句话**不泄露任何东西**：它不是关于密钥本身的信息，
     攻击者本来也只能看到"失败"，跟服务端启动日志里那行提示是同一件事。
     """
+    ip = _gm_client_ip(ws_id) if ws_id else ""
+    if ip:
+        wait = _gm_block_remaining(ip)
+        if wait:
+            # 限流提示**先于**其它判断：被封了就别说密钥对不对，
+            # 否则等于免费告诉爆破者"这个密钥是错的"，省了他一轮
+            return f"GM认证失败次数过多，请 {wait} 秒后再试"
     if not GM_SECRET:
         return "GM 功能未启用：服务端未配置 GM_SECRET 环境变量（此时任何密钥都会被拒绝）"
     if not hmac.compare_digest(str(msg.get("gm_secret", "")), GM_SECRET):
+        # 触发封禁的那一次就直接告知，不让状态变了、提示却慢一拍
+        blocked = _gm_note_fail(ip) if ip else 0
+        if blocked:
+            return f"GM认证失败次数过多，请 {blocked} 秒后再试"
         return "GM认证失败"
+    if ip:
+        _gm_note_ok(ip)
     return ""
 
 
@@ -858,7 +959,7 @@ def _gen_invite_code() -> str:
 
 async def on_gm_gen_invite(ws_id: str, msg: dict):
     """GM生成邀请码（需GM认证）"""
-    _fail = _gm_auth_fail(msg)
+    _fail = _gm_auth_fail(msg, ws_id)
     if _fail:
         await send(ws_id, pack(type="gm_gen_invite_result", ok=False, msg=_fail))
         return
@@ -873,7 +974,7 @@ async def on_gm_gen_invite(ws_id: str, msg: dict):
 
 async def on_gm_invite_count(ws_id: str, msg: dict):
     """GM查询剩余邀请码数量（需GM认证）"""
-    _fail = _gm_auth_fail(msg)
+    _fail = _gm_auth_fail(msg, ws_id)
     if _fail:
         await send(ws_id, pack(type="gm_invite_count_result", ok=False, msg=_fail))
         return
@@ -906,7 +1007,7 @@ async def on_validate_invite(ws_id: str, msg: dict):
 
 
 async def on_gm_search(ws_id: str, msg: dict):
-    _fail = _gm_auth_fail(msg)
+    _fail = _gm_auth_fail(msg, ws_id)
     if _fail:
         await send(ws_id, pack(type="gm_search_result", ok=False, msg=_fail))
         return
@@ -935,7 +1036,7 @@ async def on_gm_search(ws_id: str, msg: dict):
     await send(ws_id, pack(type="gm_search_result", ok=True, results=results))
 
 async def on_gm_give(ws_id: str, msg: dict):
-    _fail = _gm_auth_fail(msg)
+    _fail = _gm_auth_fail(msg, ws_id)
     if _fail:
         await send(ws_id, pack(type="gm_give_result", ok=False, msg=_fail))
         return
@@ -1048,6 +1149,7 @@ async def cleaner():
         await asyncio.sleep(60)
         try:
             clean_sessions()
+            _gm_prune_rate_limit()      # 清过期的 GM 失败记录/封禁（防按 IP 缓慢泄漏）
             now = time.time()
             expired = [c for c, r in rooms.items()
                        if now - r["last_active"] > ROOM_TIMEOUT]
