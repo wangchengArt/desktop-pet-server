@@ -797,10 +797,29 @@ async def on_change_password(ws_id: str, msg: dict):
 
 # ── GM 命令 ─────────────────────────────────────────────
 def _gm_auth_check(msg: dict) -> bool:
-    """GM 认证：未配置 GM_SECRET 时一律拒绝，配置后常量时间比对"""
+    """GM 认证：未配置 GM_SECRET 时一律拒绝，配置后常量时间比对
+
+    ⚠️ 新代码请用 `_gm_auth_fail(msg)` —— 它能区分「没配」和「填错」。
+    这个布尔版留着是因为其它地方还有引用，但用它就只能回一句笼统的失败。
+    """
+    return not _gm_auth_fail(msg)
+
+
+def _gm_auth_fail(msg: dict) -> str:
+    """**空串 = 通过**；否则返回该回给客户端的原因。
+
+    为什么要区分（2026-09-28）：两种失败的原因完全不同，但原先都回
+    「GM认证失败」，客户端分不出来 —— 用户明明填对了密钥却一直被拒，
+    而真正的原因是服务端压根没配（fail-closed 设计），界面上没有任何线索。
+
+    「未配置」这句话**不泄露任何东西**：它不是关于密钥本身的信息，
+    攻击者本来也只能看到"失败"，跟服务端启动日志里那行提示是同一件事。
+    """
     if not GM_SECRET:
-        return False
-    return hmac.compare_digest(str(msg.get("gm_secret", "")), GM_SECRET)
+        return "GM 功能未启用：服务端未配置 GM_SECRET 环境变量（此时任何密钥都会被拒绝）"
+    if not hmac.compare_digest(str(msg.get("gm_secret", "")), GM_SECRET):
+        return "GM认证失败"
+    return ""
 
 
 # ── 邀请码管理 ──────────────────────────────────────────
@@ -839,8 +858,9 @@ def _gen_invite_code() -> str:
 
 async def on_gm_gen_invite(ws_id: str, msg: dict):
     """GM生成邀请码（需GM认证）"""
-    if not _gm_auth_check(msg):
-        await send(ws_id, pack(type="gm_gen_invite_result", ok=False, msg="GM认证失败"))
+    _fail = _gm_auth_fail(msg)
+    if _fail:
+        await send(ws_id, pack(type="gm_gen_invite_result", ok=False, msg=_fail))
         return
     data = _load_invites()
     code = _gen_invite_code()
@@ -853,8 +873,9 @@ async def on_gm_gen_invite(ws_id: str, msg: dict):
 
 async def on_gm_invite_count(ws_id: str, msg: dict):
     """GM查询剩余邀请码数量（需GM认证）"""
-    if not _gm_auth_check(msg):
-        await send(ws_id, pack(type="gm_invite_count_result", ok=False, msg="GM认证失败"))
+    _fail = _gm_auth_fail(msg)
+    if _fail:
+        await send(ws_id, pack(type="gm_invite_count_result", ok=False, msg=_fail))
         return
     data = _load_invites()
     count = sum(1 for c in data["codes"].values() if not c["used"])
@@ -885,8 +906,9 @@ async def on_validate_invite(ws_id: str, msg: dict):
 
 
 async def on_gm_search(ws_id: str, msg: dict):
-    if not _gm_auth_check(msg):
-        await send(ws_id, pack(type="gm_search_result", ok=False, msg="GM认证失败"))
+    _fail = _gm_auth_fail(msg)
+    if _fail:
+        await send(ws_id, pack(type="gm_search_result", ok=False, msg=_fail))
         return
     query = msg.get("query", "").strip()
     results = []
@@ -913,8 +935,9 @@ async def on_gm_search(ws_id: str, msg: dict):
     await send(ws_id, pack(type="gm_search_result", ok=True, results=results))
 
 async def on_gm_give(ws_id: str, msg: dict):
-    if not _gm_auth_check(msg):
-        await send(ws_id, pack(type="gm_give_result", ok=False, msg="GM认证失败"))
+    _fail = _gm_auth_fail(msg)
+    if _fail:
+        await send(ws_id, pack(type="gm_give_result", ok=False, msg=_fail))
         return
     pid = msg.get("user_id", "")
     gtype = msg.get("give_type", "coins")
