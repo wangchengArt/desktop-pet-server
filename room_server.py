@@ -42,6 +42,35 @@ logging.getLogger("websockets").setLevel(logging.CRITICAL)
 logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 logging.getLogger("websockets.asyncio").setLevel(logging.CRITICAL)
 
+
+# ── 热路径日志节流（2026-10-12）────────────────────────────────
+# ⚠️ **为什么必须有**：systemd 下 `print()` 走 **journald，是同步阻塞写**，
+#    而这几句跑在 **asyncio 事件循环**里。按「每个连接写一次」的话，
+#    连接一多（公网端口天天被扫）就把循环堵住 —— 本工程记过一次同类事故：
+#    扫描器噪声让日志涨到 119MB、事件循环写盘卡死、客户端集体掉线。
+#    当时只把 `websockets` 自己的 logger 压到 CRITICAL，**我们自己的 print 漏了**。
+#
+# 2026-10-12 线上实测（同一台机器）：WS 握手 中位 4314ms / 最大 14414ms，
+# 而服务端自报 `conns=1` —— 主因在机器侧（用户态被饿死，连 SSH 都拿不到 SSH 横幅），
+# 但「每连接一次同步写」会**放大**它，而且是我们自己能控的那一半。
+#
+# 为什么是**节流**而不是删掉：连接/断开这两条恰恰是排查时最有用的，
+# 只是不该按「每连接一次」的粒度写。1 秒一次既保住信息，又把写量压成常数。
+_PRINT_MIN_INTERVAL = 1.0
+_last_print_at: dict = {}
+
+
+def _tprint(key: str, msg: str) -> None:
+    """按 `key` 节流的 print —— 同一个 key 最快 1 秒写一次。
+
+    只给**热路径**（每连接 / 每次握手失败）用；低频的（开局、GM 操作）直接 print。
+    """
+    now = time.monotonic()
+    if now - _last_print_at.get(key, 0.0) < _PRINT_MIN_INTERVAL:
+        return
+    _last_print_at[key] = now
+    print(msg, flush=True)
+
 # ── 配置 ────────────────────────────────────────────────────
 AUTH_TOKEN   = os.environ.get("AUTH_TOKEN", "").strip()
 MAX_MSG_SIZE = 64 * 1024        # 64KB 单条消息上限
@@ -1078,7 +1107,8 @@ async def on_gm_give(ws_id: str, msg: dict):
 async def handle(ws: WebSocketServerProtocol, path: str = "/"):
     ws_id = new_id()
     conns[ws_id] = {"ws": ws, "room": None, "role": None, "auth_player_id": None}
-    print(f"[>] {ws_id} 已连接  （在线: {len(conns)}）")
+    # 热路径：公网端口天天被扫，这两句以前是**每连接一次**同步写 journald
+    _tprint("conn_up", f"[>] {ws_id} 已连接  （在线: {len(conns)}）")
 
     auth_passed = (AUTH_TOKEN == "")   # 未配置 token 则跳过认证
 
@@ -1100,7 +1130,7 @@ async def handle(ws: WebSocketServerProtocol, path: str = "/"):
                 token = msg.get("auth_token", "")
                 if token != AUTH_TOKEN:
                     await send(ws_id, error("认证失败：token 不匹配"))
-                    print(f"[!] {ws_id} 认证失败")
+                    _tprint("auth_fail", f"[!] {ws_id} 认证失败")
                     return
                 auth_passed = True
                 await send(ws_id, pack(type="auth_ok"))
@@ -1133,7 +1163,7 @@ async def handle(ws: WebSocketServerProtocol, path: str = "/"):
         if pid and player_registry.get(pid) == ws_id:
             player_registry.pop(pid, None)
         conns.pop(ws_id, None)
-        print(f"[<] {ws_id} 断开  （在线: {len(conns)}）")
+        _tprint("conn_down", f"[<] {ws_id} 断开  （在线: {len(conns)}）")
 
 
 # ── 空闲房间清理 ──────────────────────────────────────────
@@ -1148,7 +1178,12 @@ async def cleaner():
     while True:
         await asyncio.sleep(60)
         try:
-            clean_sessions()
+            # ⚠️ **挪到线程池**：`clean_sessions()` 要逐个 `open()`/`json.load()`
+            #    sessions/ 下的每个文件 —— 纯同步 I/O。跑在事件循环上的话，
+            #    卡多久完全取决于**文件有多少**（这台的 sessions/ 从 8 月攒到现在），
+            #    而它就卡在「每 60 秒一次」这个节骨眼上。
+            #    低频任务丢给线程零代价，循环不再被它顶住。
+            await asyncio.get_running_loop().run_in_executor(None, clean_sessions)
             _gm_prune_rate_limit()      # 清过期的 GM 失败记录/封禁（防按 IP 缓慢泄漏）
             now = time.time()
             expired = [c for c, r in rooms.items()
