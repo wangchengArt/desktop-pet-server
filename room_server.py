@@ -834,13 +834,25 @@ def _gm_auth_check(msg: dict) -> bool:
     return not _gm_auth_fail(msg)
 
 
-# ── GM 认证失败限流 ────────────────────────────────────────
-# 为什么必须有（2026-09-28）：GM 接口原先**没有任何频率限制** —— 失败多少次
+# ── GM 认证失败限流（2026-09-28 加；2026-10-14 起**默认关闭**）──────
+# 为什么当初要加（2026-09-28）：GM 接口原先**没有任何频率限制** —— 失败多少次
 # 都不拦。而密钥是 6 位纯数字（100 万种组合），按 100 次/秒算 ≈ 2.8 小时就能
 # 爆破完，拿到之后可以给任意玩家发任意物品/金币、拉全服玩家名单。
 # 限流之后这条路才堵上；否则弱密钥等于没设。
 #
-# 三个参数都可用环境变量调，不用改代码重启：
+# ⚠️⚠️ **为什么 2026-10-14 改成默认关闭**（用户要求）：
+#   限流的**前提是密钥弱**。而「按来源 IP 封禁」有个用户直接撞上的副作用 ——
+#   **同一条宽带下的几台电脑公网 IP 是同一个**，一台手滑，其余的也一起被挡在
+#   门外；6 位密钥本来就容易手滑。用户的诉求是「换到别的电脑也能随时登」。
+#
+#   所以改成：**用长密钥**（systemd 主 unit 里那个 48 位 hex）**+ 限流默认关**。
+#   长密钥爆不动，本来就不需要限流 —— 两个措施是配套的，别只做一个：
+#   关限流而仍用 6 位密钥 = 把爆破口重新打开。
+#
+# 想再打开：环境变量 `GM_RATE_LIMIT=1`（下面三个参数照旧可调）。
+# 代码一行没删 —— 哪天密钥又换短的，打开就能用。
+GM_RATE_LIMIT = os.environ.get("GM_RATE_LIMIT", "0").strip().lower() not in ("", "0", "false", "no")
+
 #   GM_FAIL_WINDOW  统计窗口（秒，默认 60）
 #   GM_FAIL_MAX     窗口内允许的失败次数（默认 5）
 #   GM_FAIL_BLOCK   超限后封禁多久（秒，默认 300）
@@ -882,10 +894,18 @@ def _gm_note_fail(ip: str) -> int:
 
     返回而不是返回 None，是为了让「触发封禁的那一次请求」就能立刻回
     「次数过多」—— 否则状态在这一次变了、提示却要等下一次才出现。
+
+    `GM_RATE_LIMIT` 关着时**只记日志、不封禁** —— 运维仍然要能看到
+    「有人在试密钥」，但那不该把操作者本人挡在门外（见文件里那段说明）。
     """
     now = time.time()
     lst = [t for t in _gm_fails.get(ip, []) if t > now - GM_FAIL_WINDOW]
     lst.append(now)
+    if not GM_RATE_LIMIT:
+        _gm_fails[ip] = lst
+        print(f"[!] GM 认证失败（来源 {ip}，窗口内第 {len(lst)} 次；"
+              f"GM_RATE_LIMIT 关闭，不封禁）", flush=True)
+        return 0
     blocked = 0
     if len(lst) >= GM_FAIL_MAX:
         _gm_blocked[ip] = now + GM_FAIL_BLOCK
@@ -933,7 +953,9 @@ def _gm_auth_fail(msg: dict, ws_id: str = "") -> str:
     攻击者本来也只能看到"失败"，跟服务端启动日志里那行提示是同一件事。
     """
     ip = _gm_client_ip(ws_id) if ws_id else ""
-    if ip:
+    # ⚠️ `GM_RATE_LIMIT` 关着时**连查都不查** —— 否则封禁字典里万一还留着
+    #    上次开着时写进去的记录，关了限流却仍被挡（改完配置得能立刻生效）。
+    if ip and GM_RATE_LIMIT:
         wait = _gm_block_remaining(ip)
         if wait:
             # 限流提示**先于**其它判断：被封了就别说密钥对不对，
@@ -1242,7 +1264,14 @@ async def main():
     if AUTH_TOKEN:
         print(f"已启用 Token 认证")
     if GM_SECRET:
-        print(f"GM 已启用（密钥已配置）")
+        # 顺带报密钥长度 —— 运维一眼能看出「是不是还在用短密钥」。
+        # ⚠️ 只报**长度**，不报内容（这句会进 journald，日志可能被人看到）。
+        print(f"GM 已启用（密钥长度 {len(GM_SECRET)}）")
+        if GM_RATE_LIMIT:
+            print(f"GM 失败限流: 开（窗口 {GM_FAIL_WINDOW}s / {GM_FAIL_MAX} 次 → 封 {GM_FAIL_BLOCK}s，按来源 IP）")
+        else:
+            print("GM 失败限流: 关（默认；失败只记日志不封禁）"
+                  + ("（密钥偏短，建议改成 32 位以上随机串）" if len(GM_SECRET) < 16 else ""))
     else:
         print(f"GM 已禁用（未设置 GM_SECRET 环境变量）")
     print("-" * 40)
