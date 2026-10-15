@@ -338,15 +338,16 @@ async def on_create(ws_id: str, msg: dict):
     pet = msg.get("pet", {})
     if len(json.dumps(pet)) > MAX_PET_SIZE:
         pet = {"name": "房主的宠物"}
-    member = {"ws_id": ws_id, "pet": pet, "joined_at": time.time()}
-    rooms[code] = {
-        "members":     [member],
-        "created_at":  time.time(),
-        "last_active": time.time(),
-    }
+    room = {"members": [], "created_at": time.time(), "last_active": time.time()}
+    # S2 / S4：房主坐 1 号，同样走**入座的唯一出口** ——
+    # 别在这里手写列表字面量：一处手写、一处走函数，两边早晚对不上。
+    seat = _add_member(room, ws_id, pet)
+    rooms[code] = room
     conns[ws_id]["room"] = code
     conns[ws_id]["role"] = "host"
-    await send(ws_id, pack(type="room_created", code=code, members=[]))
+    # `seat` 单独回一份：客户端要知道**自己**坐几号，
+    # 而 `members` 一直是「不含自己」的列表，在里面找不到自己。
+    await send(ws_id, pack(type="room_created", code=code, members=[], seat=seat))
     print(f"[+] 房间 {code} 由 {ws_id} 创建")
 
 
@@ -362,23 +363,24 @@ async def on_join(ws_id: str, msg: dict):
     if not room:
         await send(ws_id, error(f"房间 [{code}] 不存在"))
         return
-    if len(room["members"]) >= MAX_PLAYERS:
-        await send(ws_id, error(f"房间 [{code}] 已满（最多{MAX_PLAYERS}人）"))
-        return
-
     pet = msg.get("pet", {})
     if len(json.dumps(pet)) > MAX_PET_SIZE:
         pet = {"name": "好友的宠物"}
 
-    new_member = {"ws_id": ws_id, "pet": pet, "joined_at": time.time()}
-    room["members"].append(new_member)
-    room["last_active"] = time.time()
+    # S2/S4：入座走**唯一出口**（它内部按座位号判满员 —— 比数人数严格：
+    # 成员列表万一有重复或脏座位号，数人数会放过一个「其实没座位」的人）
+    seat = _add_member(room, ws_id, pet)
+    if seat == 0:
+        await send(ws_id, error(f"房间 [{code}] 已满（最多{MAX_PLAYERS}人）"))
+        return
+    new_member = room["members"][-1]
     conns[ws_id]["room"] = code
     conns[ws_id]["role"] = "guest"
 
-    # 告诉加入者房间信息（不包括自己）
+    # 告诉加入者房间信息（不包括自己），以及**自己坐几号**
     others = [m for m in room["members"] if m["ws_id"] != ws_id]
-    await send(ws_id, pack(type="room_joined", code=code, members=others))
+    await send(ws_id, pack(type="room_joined", code=code, members=others,
+                           seat=seat))
     # 告诉其他人有新人来了
     await broadcast_to_room(ws_id, pack(type="member_joined", member=new_member))
     print(f"[+] {ws_id} 加入房间 {code}（共{len(room['members'])}人）")
@@ -430,6 +432,129 @@ async def on_sync(ws_id: str, msg: dict):
     await broadcast_to_room(ws_id, pack(type="remote_sync", **payload))
 
 
+def _room_of(ws_id: str):
+    """这条连接所在的房间码（None = 不在任何房间）"""
+    return conns.get(ws_id, {}).get("room")
+
+
+def _free_seat(room: dict) -> int:
+    """房间里**最小的空座位号**（1 起）；满了返回 0。
+
+    为什么是「最小空号」而不是「人数 + 1」：座位号要**不漂移**。
+    2 号走了、再来个人补上，他应该坐 2 号 —— 取 len+1 的话他会坐 3 号，
+    而 4/5 人局的回合顺序是按座位号走的，凭空多个空号会让顺序莫名其妙。
+
+    ⚠️ 座位号是 4/5 人身份局的**地基**：身份、阵营、回合顺序、点名目标、
+    结算列表全要按它对齐。而 `members` 里原来只有 `ws_id`，偏偏 `ws_id`
+    **每次连接都重新随机生成**（`new_id()`）—— 拿它当座位用不了，
+    断线重连也认不回原位。
+    """
+    used = {m.get("seat") for m in room["members"]}
+    for i in range(1, MAX_PLAYERS + 1):
+        if i not in used:
+            return i
+    return 0
+
+
+def _seat_of(ws_id: str) -> int:
+    """这条连接在它房间里坐几号；不在房间返回 0。"""
+    code = _room_of(ws_id)
+    room = rooms.get(code) if code else None
+    if not room:
+        return 0
+    for m in room["members"]:
+        if m["ws_id"] == ws_id:
+            return int(m.get("seat") or 0)
+    return 0
+
+
+def _add_member(room: dict, ws_id: str, pet) -> int:
+    """把一个人放进房间，返回他的座位号；**满了返回 0，且什么都不改**。
+
+    ★ 这是「入座」的**唯一出口**（S4）—— `on_join`、匹配建房、以及以后任何
+    新的组局路径都必须走它。为什么要有这个出口：匹配建房原来是**直接构造
+    `members` 列表**的，把 `MAX_PLAYERS` 整个绕过去了。2 人匹配看不出来，
+    但将来做 4 / 5 人匹配时，那一处只要忘了判就会**静默超员**
+    ——「6 个人进了 5 人房」，而引擎那边会直接按座位号越界。
+    """
+    seat = _free_seat(room)
+    if seat == 0:
+        return 0
+    room["members"].append(_member(ws_id, pet, seat))
+    room["last_active"] = time.time()
+    return seat
+
+
+def _make_match_room(pairs: list):
+    """给一批匹配到的玩家建一间临时房。
+
+    返回 `(房间码, {ws_id: 座位号})`；**坐不下返回 None，且一个房间都不留下**
+    —— 别留半间房（那会让后续 `_same_room` 之类的校验看到一间残缺的房）。
+    """
+    code = gen_code()
+    room = {"members": [], "created_at": time.time(), "last_active": time.time()}
+    seats = {}
+    for wid, pt in pairs:
+        seat = _add_member(room, wid, pt)
+        if seat == 0:
+            return None
+        seats[wid] = seat
+    rooms[code] = room
+    return code, seats
+
+
+def _member(ws_id: str, pet, seat: int) -> dict:
+    """房间成员的结构 —— **只在这里定义一次**。
+
+    建房 / 加入 / 匹配建房三处都要造它。散着写早晚有一处漏字段，
+    而漏掉的若是 `seat` 这种「没有它也能跑、只是悄悄错位」的字段，最难查。
+    """
+    return {"ws_id": ws_id, "pet": pet, "joined_at": time.time(), "seat": seat}
+
+
+def _touch_room(ws_id: str) -> None:
+    """给「房间最近有活动」打点（S3）。
+
+    ⚠️ 为什么必须补（2026-10-15）：`last_active` 原来**只**在
+    create_room / join_room / sync 三处刷新，而 1v1 对局全程只发 `pvp_move`、
+    **根本不发 `sync`** —— 于是一局超过 `ROOM_TIMEOUT`（30 分钟）的对局会被
+    cleaner 判成「空闲房间」拆掉。
+
+    拆掉的后果不只是房间没了：cleaner 会把 `conns[...]["room"]` 一起清空，
+    而 S1 新增的同房间校验从此会**拒掉双方所有的定向消息** → 对局当场冻住。
+    所以「对局消息算不算房间活动」这件事，是和 S1 绑在一起的。
+    """
+    code = _room_of(ws_id)
+    if code and code in rooms:
+        rooms[code]["last_active"] = time.time()
+
+
+def _same_room(ws_id: str, target_id: str) -> bool:
+    """定向投递前的**同房间校验**（S1）。
+
+    ⚠️ 为什么必须有（2026-10-15）：`target_ws_id` 是**客户端自报**的，
+    服务端原来一句话都不问就 `send(target)` —— 于是任何客户端都能把
+    `pvp_move` / `game_invite` / `pvp_accept` / `pvp_decline` 定向发给
+    **全服任意一条连接**（`ws_id` 是 12 位随机 hex、猜不到，但服务端零设防）。
+
+    做 4/5 人身份局之前必须先堵上：那条路会把「谁能收到什么」整个交到客户端手里，
+    而身份局的全部价值就在「谁该收到什么」。
+    """
+    a = _room_of(ws_id)
+    b = _room_of(target_id)
+    return bool(a) and a == b
+
+
+async def _reject_cross_room(ws_id: str, target: str, what: str) -> None:
+    """跨房间定向投递：记一笔日志并回绝。
+
+    ⚠️ 回的是「对方不在同一房间」，**不是**「目标不存在」——
+    后者等于给出一个可以拿来探测 `ws_id` 是否存在的接口。这是攻击面，别回细节。
+    """
+    print(f"[!] 跨房间定向投递被拒：{what}  from={ws_id} to={target}", flush=True)
+    await send(ws_id, error("对方不在同一房间，消息未送达"))
+
+
 def _clear_battle(ws_id: str):
     """清除某个玩家的对战状态"""
     opp = battles.pop(ws_id, None)
@@ -458,8 +583,13 @@ async def on_pvp_move(ws_id: str, msg: dict):
     payload = {k: v for k, v in msg.items() if k not in ("type", "target_ws_id")}
     payload["from_ws_id"] = ws_id
     if target:
+        if not _same_room(ws_id, target):          # S1
+            await _reject_cross_room(ws_id, target, "pvp_move")
+            return
+        _touch_room(ws_id)                          # S3
         await send(target, pack(type="pvp_move", **payload))
     else:
+        _touch_room(ws_id)                          # S3
         await broadcast_to_room(ws_id, pack(type="pvp_move", **payload))
 
 
@@ -472,17 +602,23 @@ async def on_game_invite(ws_id: str, msg: dict):
         await send(ws_id, error("你正在对战中，无法发起邀请"))
         return
     if target_id:
+        if not _same_room(ws_id, target_id):        # S1
+            await _reject_cross_room(ws_id, target_id, "game_invite")
+            return
         if target_id in battles:
             await send(ws_id, error("对方正在对战"))
             return
+        _touch_room(ws_id)                          # S3
         await send(target_id, pack(type="game_invite", **payload))
     else:
+        _touch_room(ws_id)                          # S3
         await broadcast_to_room(ws_id, pack(type="game_invite", **payload))
 
 
 async def on_bubble(ws_id: str, msg: dict):
     payload = {k: v for k, v in msg.items() if k != "type"}
     payload["from_ws_id"] = ws_id
+    _touch_room(ws_id)                              # S3
     await broadcast_to_room(ws_id, pack(type="remote_bubble", **payload))
 
 
@@ -491,18 +627,30 @@ async def on_pvp_accept(ws_id: str, msg: dict):
     payload = {k: v for k, v in msg.items() if k not in ("type", "target_ws_id")}
     payload["from_ws_id"] = ws_id
     if target:
+        # ⚠️ 顺序要紧：校验必须在**写 `battles` 之前** —— 否则跨房间的伪造 accept
+        #    虽发不出去，却已经在服务端把双方标成「对战中」了。
+        if not _same_room(ws_id, target):           # S1
+            await _reject_cross_room(ws_id, target, "pvp_accept")
+            return
         battles[ws_id] = target
         battles[target] = ws_id
+        _touch_room(ws_id)                          # S3
         await send(target, pack(type="pvp_accept", **payload))
     else:
+        _touch_room(ws_id)                          # S3
         await broadcast_to_room(ws_id, pack(type="pvp_accept", **payload))
 
 
 async def on_pvp_decline(ws_id: str, msg: dict):
     target = msg.get("target_ws_id", "")
     if target:
+        if not _same_room(ws_id, target):           # S1
+            await _reject_cross_room(ws_id, target, "pvp_decline")
+            return
+        _touch_room(ws_id)                          # S3
         await send(target, pack(type="pvp_decline", from_ws_id=ws_id))
     else:
+        _touch_room(ws_id)                          # S3
         await broadcast_to_room(ws_id, pack(type="pvp_decline", from_ws_id=ws_id))
 
 
@@ -532,24 +680,28 @@ async def on_match_request(ws_id: str, msg: dict):
         peer_pet = match_pets.pop(peer_id, {})
         match_pets.pop(ws_id, None)
         # 建立临时对战房间，复用 pvp_move 广播
-        code = gen_code()
-        rooms[code] = {
-            "members": [
-                {"ws_id": peer_id, "pet": peer_pet, "joined_at": time.time()},
-                {"ws_id": ws_id, "pet": pet, "joined_at": time.time()},
-            ],
-            "created_at": time.time(),
-            "last_active": time.time(),
-        }
+        # ★ S4：走 `_make_match_room`（内部 `_add_member`）—— 原来这里是
+        #   **直接构造 members 列表**的，绕过了 `MAX_PLAYERS`。2 人匹配看不出问题，
+        #   将来做 N 人匹配时那一处忘了判就会静默超员。
+        _made = _make_match_room([(peer_id, peer_pet), (ws_id, pet)])
+        if _made is None:
+            # 坐不下 → **不能开局，也不能静默超员**。理论上到不了（2 < MAX_PLAYERS），
+            # 但真到了多半是 `MAX_PLAYERS` 被配小了，宁可两边都收到明确错误。
+            print(f"[!] 匹配建房失败：坐不下（MAX_PLAYERS={MAX_PLAYERS}）"
+                  f" {peer_id} vs {ws_id}", flush=True)
+            await send(ws_id, error("匹配失败：房间坐不下（服务端配置异常）"))
+            await send(peer_id, error("匹配失败：房间坐不下（服务端配置异常）"))
+            return
+        code, _seats = _made
         conns[peer_id]["room"] = code
         conns[peer_id]["role"] = "host"
         conns[ws_id]["room"] = code
         conns[ws_id]["role"] = "guest"
         seed = secrets.token_hex(3)
         await send(peer_id, pack(type="match_found", game=game, is_host=True,
-                                 seed=seed, opponent=pet))
+                                 seat=_seats[peer_id], seed=seed, opponent=pet))
         await send(ws_id, pack(type="match_found", game=game, is_host=False,
-                               seed=seed, opponent=peer_pet))
+                               seat=_seats[ws_id], seed=seed, opponent=peer_pet))
         print(f"[+] 匹配成功 {peer_id} vs {ws_id}（{game}）")
     else:
         # 入队等待
