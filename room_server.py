@@ -338,7 +338,7 @@ async def on_create(ws_id: str, msg: dict):
     pet = msg.get("pet", {})
     if len(json.dumps(pet)) > MAX_PET_SIZE:
         pet = {"name": "房主的宠物"}
-    room = {"members": [], "created_at": time.time(), "last_active": time.time()}
+    room = _new_room()
     # S2 / S4：房主坐 1 号，同样走**入座的唯一出口** ——
     # 别在这里手写列表字面量：一处手写、一处走函数，两边早晚对不上。
     seat = _add_member(room, ws_id, pet)
@@ -363,6 +363,10 @@ async def on_join(ws_id: str, msg: dict):
     if not room:
         await send(ws_id, error(f"房间 [{code}] 不存在"))
         return
+    if room.get("in_game"):
+        await send(ws_id, error("这一局已经开始了，等下一局"))
+        return
+
     pet = msg.get("pet", {})
     if len(json.dumps(pet)) > MAX_PET_SIZE:
         pet = {"name": "好友的宠物"}
@@ -384,6 +388,145 @@ async def on_join(ws_id: str, msg: dict):
     # 告诉其他人有新人来了
     await broadcast_to_room(ws_id, pack(type="member_joined", member=new_member))
     print(f"[+] {ws_id} 加入房间 {code}（共{len(room['members'])}人）")
+
+
+def _host_of(room: dict) -> str:
+    """本房房主的 ws_id。**现读**，不缓存 —— 房主身份是会转移的（S7）。"""
+    for m in room["members"]:
+        if conns.get(m["ws_id"], {}).get("role") == "host":
+            return m["ws_id"]
+    return ""
+
+
+def _in_game_room(ws_id: str):
+    """取「发送者所在的对局房」。返回 `(code, room, 拒绝原因)`；没被拒时原因为空串。
+
+    S8 的三条消息**都只在対局中才有意义** —— 大厅里发它们说明客户端状态不对，
+    与其静默转发，不如明确拒掉（省得拿它去探测别人的房间）。
+    """
+    code = _room_of(ws_id)
+    room = rooms.get(code) if code else None
+    if not room:
+        return None, None, "不在房间中"
+    if not room.get("in_game"):
+        return code, None, "本房没有正在进行的对局"
+    return code, room, ""
+
+
+async def on_identity_action(ws_id: str, msg: dict):
+    """**客户端 → 房主**：点名 / 出牌 / 农场主技 / 结束回合（S8）。
+
+    三条都要查，少一条这个协议就是敞开的：
+
+      · 同房间（S1 那套）
+      · 目标**必须是本房的房主** —— 不查的话，任意客户端能把「我的动作」发给
+        同房的**另一个客户端**，那个客户端分不清这是权威指令还是别人的动作
+      · 房间在**对局中**
+
+    ★ 服务端还会**自己算**一个 `from_seat` 塞进去（用 S6 的座位表），
+    而不是信客户端自报的座位号 —— 房主靠它认「这是谁的动作」，
+    信客户端的字段等于把「我能代表几号位」交给客户端自己说。
+    """
+    code, room, why = _in_game_room(ws_id)
+    if why:
+        await send(ws_id, error(why))
+        return
+    target = msg.get("target_ws_id", "")
+    if not _same_room(ws_id, target):
+        await _reject_cross_room(ws_id, target, "identity_action")
+        return
+    if target != _host_of(room):
+        await send(ws_id, error("对局消息只能发给房主"))
+        return
+    payload = {k: v for k, v in msg.items() if k not in ("type", "target_ws_id")}
+    payload["from_ws_id"] = ws_id
+    payload["from_seat"] = _seat_of_ws(room, ws_id)     # ← 服务端算的，覆盖客户端自报
+    _touch_room(ws_id)                                   # S3：长局别被 cleaner 拆
+    await send(target, pack(type="identity_action", **payload))
+
+
+async def on_identity_state(ws_id: str, msg: dict):
+    """**房主 → 其余人**：公开状态广播（S8）。
+
+    ⚠️⚠️ **必须查发送者是不是房主**，这是本协议的要害：不查的话，任意一个
+    客户端都能往全房广播伪造的「权威状态」（改血量、改棋盘、冒充翻牌），
+    而别人没有任何办法分辨真假 —— 那等于把裁决权交给了每一个人。
+
+    不回发发送者（房主本来就是状态的来源，自己不需要收回来）。
+    """
+    code, room, why = _in_game_room(ws_id)
+    if why:
+        await send(ws_id, error(why))
+        return
+    if ws_id != _host_of(room):
+        await send(ws_id, error("只有房主能广播对局状态"))
+        return
+    payload = {k: v for k, v in msg.items() if k != "type"}
+    payload["from_ws_id"] = ws_id
+    _touch_room(ws_id)
+    await broadcast_to_room(ws_id, pack(type="identity_state", **payload))
+
+
+async def on_identity_private(ws_id: str, msg: dict):
+    """**房主 → 某一个人**：私有信息（自己的手牌 / 自己的身份 / 收网提示）（S8）。
+
+    ★ 这一条就是身份局的**信息隔离**赖以成立的地方（策划案 §2.4）：
+    「谁能看见谁的身份」在单机里是条渲染规则，到了联机必须变成**投递规则**。
+    服务端在这里仍然看不懂内容（纯转发），但保证两件事：
+    **只有权威能发**、**只发给同房的那一个人**。
+
+    ⚠️ 不查发送者的话，任意客户端都能给同房的人发伪造的「你是黄鼠狼」——
+    而那条信息的真假，收信人**无从验证**。
+    """
+    code, room, why = _in_game_room(ws_id)
+    if why:
+        await send(ws_id, error(why))
+        return
+    if ws_id != _host_of(room):
+        await send(ws_id, error("只有房主能发私有信息"))
+        return
+    target = msg.get("target_ws_id", "")
+    if not _same_room(ws_id, target):
+        await _reject_cross_room(ws_id, target, "identity_private")
+        return
+    payload = {k: v for k, v in msg.items() if k not in ("type", "target_ws_id")}
+    payload["from_ws_id"] = ws_id
+    _touch_room(ws_id)
+    await send(target, pack(type="identity_private", **payload))
+
+
+async def _abort_game_and_transfer_host(code: str, room: dict, gone_ws: str):
+    """对局中房主离开：**中止本局**，房主身份转给剩下的人，房间留着继续用。
+
+    ⚠️⚠️ 为什么是「中止」而不是「其余人继续打完」：本方案是**房主权威**
+    （策划案 §3.1）—— **只有房主那一台跑引擎**，其余人手里只有「投影过的状态」。
+    房主一断，**没有第二台机器知道真相**，对局物理上无法继续。
+    「继续打完」要**权威迁移**（把权威侧状态或动作日志交给新权威），
+    那是 M2 的活；这里先明确中止，别让玩家对着一个不动的牌桌干等。
+
+    （**非房主**离开是另一回事：房主那一台把那一席 `is_ai` 置真即可，
+    引擎现成支持混合座位，对局**继续** —— 那条路不需要服务端做任何事，
+    只要别解散房间就行，而大厅那条路本来就不解散。）
+    """
+    # 房间回到「可以用」的状态：剩下的人不用退房重进就能再开一局
+    room["in_game"] = False
+    room["n_players"] = None
+    room["seat_map"] = None
+    room["last_active"] = time.time()
+    # 房主身份转移：交给**座位号最小**的剩下的人。
+    # ⚠️ 别用「成员列表的第一个」—— 那个顺序取决于加入/离开的历史，
+    #    同一个局面在不同机器上不一定一样；座位号是确定性的。
+    _next = min(room["members"], key=lambda m: m["seat"])
+    conns[_next["ws_id"]]["role"] = "host"
+    # 先补一条 `member_left`（老客户端靠它清成员列表/收宠物），
+    # 再发 `game_aborted`（新客户端靠它知道「本局没了、回大厅」）
+    await broadcast_to_room_all(code, pack(type="member_left", ws_id=gone_ws,
+                                           members=room["members"]))
+    await broadcast_to_room_all(code, pack(type="game_aborted", reason="host_left",
+                                           host_ws_id=_next["ws_id"],
+                                           members=room["members"]))
+    print(f"[-] 房主 {gone_ws} 对局中离开 → 房间 {code} 中止本局，"
+          f"房主转给 {_next['ws_id']}（剩{len(room['members'])}人）", flush=True)
 
 
 async def on_leave(ws_id: str):
@@ -408,7 +551,13 @@ async def on_leave(ws_id: str):
         return
 
     if role == "host":
-        # 房主解散：通知所有剩余成员退出，删除房间
+        # ★ S7：**对局中**房主离开 → 不解散。中止本局、把房主转给剩下的人，
+        #   房间留着（剩下的人可以直接再开一局）。
+        if room.get("in_game"):
+            await _abort_game_and_transfer_host(code, room, ws_id)
+            return
+        # 大厅里房主离开：维持原行为（解散）—— S7 只改对局那一段，
+        # 大厅的解散语义是既有的、已被客户端依赖的行为，不顺手改。
         await broadcast_to_room_all(code, pack(type="room_disbanded"))
         del rooms[code]
         print(f"[-] 房主解散房间 {code}（通知{len(room['members'])}人退出）")
@@ -435,6 +584,66 @@ async def on_sync(ws_id: str, msg: dict):
 def _room_of(ws_id: str):
     """这条连接所在的房间码（None = 不在任何房间）"""
     return conns.get(ws_id, {}).get("room")
+
+
+def _new_room() -> dict:
+    """一间空房的状态 —— **只在这里定义一次**。
+
+    建房 / 匹配建房都造它。散着写早晚有一处漏字段，而漏掉的若是
+    `in_game` 这种「没有它也能跑、只是大厅行为不对」的字段，最难查。
+    """
+    return {"members": [], "created_at": time.time(), "last_active": time.time(),
+            "in_game": False,      # S5：开局之后不许再有人进来
+            "n_players": None,     # S5：本局几人（4 / 5），未开局为 None
+            # S6：开局那一刻钉下来的座位表，**单一事实来源**。
+            # `[{"seat":1,"ws_id":"..."} | {"seat":3,"ws_id":None}]`，
+            # `ws_id is None` = 这一席由 AI 补位。
+            "seat_map": None}
+
+
+def _seat_map(room: dict, n_players: int) -> list:
+    """开局时的座位表：`[{"seat": 1, "ws_id": "..."} | {"seat": 3, "ws_id": None}, ...]`
+
+    `ws_id is None` = **这一席由 AI 补位**（引擎侧 `Seat.is_ai` 现成支持混合座位）。
+
+    ★ 游戏座位**直接沿用房间座位号**，不做重映射 —— 玩家在大厅里看到
+    「你是 2 号位」，进局之后还是 2 号位。重映射会让「几号位」在开局那一刻
+    悄悄变一次，而身份局的座位（回合顺序、点名、结算列表）是要读一整局的东西。
+    """
+    humans = {m["seat"]: m["ws_id"] for m in room["members"]}
+    return [{"seat": i, "ws_id": humans.get(i)}
+            for i in range(1, n_players + 1)]
+
+
+def _seat_map_now(room: dict) -> list:
+    """本房**当前**的座位表。
+
+    未开局返回**空** —— 「哪几席是 AI」在开局前是**不确定的**（取决于房主
+    最后选 4 还是 5、以及那时谁还在座），所以这里不猜、也不给预览。
+    已开局返回开局那一刻钉下来的那一份。
+    """
+    return list(room.get("seat_map") or [])
+
+
+def _seat_of_ws(room: dict, ws_id: str) -> int:
+    """对局里这条连接占几号席；不在座位表里返回 0。
+
+    ⚠️ 与 `_seat_of` 的区别：`_seat_of` 读的是**大厅成员表**（开局前，
+    谁坐几号由加入顺序定），这个读的是**开局钉下来的座位表**。
+    对局开始之后，一切以座位表为准 —— 大厅成员表在那一刻就冻结了。
+    """
+    for x in _seat_map_now(room):
+        if x.get("ws_id") == ws_id:
+            return int(x["seat"])
+    return 0
+
+
+def _is_ai_seat(room: dict, seat: int) -> bool:
+    """这一席是不是 AI 补位（S6）。不在座位表里返回 False。"""
+    for x in _seat_map_now(room):
+        if int(x["seat"]) == seat:
+            return x.get("ws_id") is None
+    return False
 
 
 def _free_seat(room: dict) -> int:
@@ -492,7 +701,7 @@ def _make_match_room(pairs: list):
     —— 别留半间房（那会让后续 `_same_room` 之类的校验看到一间残缺的房）。
     """
     code = gen_code()
-    room = {"members": [], "created_at": time.time(), "last_active": time.time()}
+    room = _new_room()
     seats = {}
     for wid, pt in pairs:
         seat = _add_member(room, wid, pt)
@@ -509,7 +718,10 @@ def _member(ws_id: str, pet, seat: int) -> dict:
     建房 / 加入 / 匹配建房三处都要造它。散着写早晚有一处漏字段，
     而漏掉的若是 `seat` 这种「没有它也能跑、只是悄悄错位」的字段，最难查。
     """
-    return {"ws_id": ws_id, "pet": pet, "joined_at": time.time(), "seat": seat}
+    return {"ws_id": ws_id, "pet": pet, "joined_at": time.time(), "seat": seat,
+            # S5：大厅里的「准备好了」。默认 False —— 让「没准备」是显式动作，
+            # 而不是「没操作过也算准备」（后者在 4/5 人房里等于没有这个闸）
+            "ready": False}
 
 
 def _touch_room(ws_id: str) -> None:
@@ -613,6 +825,89 @@ async def on_game_invite(ws_id: str, msg: dict):
     else:
         _touch_room(ws_id)                          # S3
         await broadcast_to_room(ws_id, pack(type="game_invite", **payload))
+
+
+async def on_ready(ws_id: str, msg: dict):
+    """大厅里报「准备好了 / 取消准备」（S5）。
+
+    广播给**全房（含自己）**：准备状态是公开信息，而且客户端要立刻回显
+    自己那一位的状态，让发送者也走同一条路比「本地先改、等广播对账」简单。
+    """
+    code = _room_of(ws_id)
+    room = rooms.get(code) if code else None
+    if not room:
+        await send(ws_id, error("不在房间中"))
+        return
+    if room.get("in_game"):
+        await send(ws_id, error("对局已经开始了"))
+        return
+    want = bool(msg.get("ready", True))
+    for m in room["members"]:
+        if m["ws_id"] == ws_id:
+            m["ready"] = want
+            break
+    _touch_room(ws_id)
+    await broadcast_to_room_all(code, pack(type="member_ready", ws_id=ws_id,
+                                          ready=want, members=room["members"]))
+
+
+async def on_start_game(ws_id: str, msg: dict):
+    """房主开局：定人数（**只能 4 / 5**），不够的席位由 **AI 补位**（S5）。
+
+    ⚠️ 服务端**不跑引擎** —— 本方案的权威模型是「房主权威」
+    （`策划案/弱鸡杀_联机方案_v1.md` §3.1）。这里只做三件事：
+    **校验、定座位表、广播**；真正建 `IdentitySession` 的是房主端。
+    """
+    code = _room_of(ws_id)
+    room = rooms.get(code) if code else None
+    if not room:
+        await send(ws_id, error("不在房间中"))
+        return
+    if conns[ws_id]["role"] != "host":
+        await send(ws_id, error("只有房主能开局"))
+        return
+    if room.get("in_game"):
+        await send(ws_id, error("对局已经开始了"))
+        return
+    try:
+        n = int(msg.get("n_players") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    # ⚠️ **只允许 4 / 5**：引擎的 `STATS` 只有这两张表
+    #    （`weak_identity.py` 的 `STATS = {4: {...}, 5: {...}}`）。
+    #    放一个 3 或 6 过去，房主端建 session 会直接 KeyError —— 而且是
+    #    **房主那一台崩**，其他人只看到「开局没反应」。所以闸设在这里。
+    if n not in (4, 5):
+        await send(ws_id, error("人数只能是 4 或 5"))
+        return
+    if len(room["members"]) > n:
+        await send(ws_id, error(f"房间里已经有 {len(room['members'])} 个人，"
+                                f"装不进 {n} 人局"))
+        return
+    # 座位号是沿用房间号的，所以「最大座位号」也不能超过人数
+    # （比如 2 号走了、来个人补了 5 号，这时开 4 人局就装不下）
+    _max_seat = max(m["seat"] for m in room["members"])
+    if _max_seat > n:
+        await send(ws_id, error(f"最大座位号是 {_max_seat}，装不进 {n} 人局"))
+        return
+    # 除房主外都要先准备 —— **房主的「开局」本身就是他的准备**（最少摩擦：
+    # 否则房主要先点一次准备、再点一次开局，那一步没有信息量）
+    _notready = [m for m in room["members"]
+                 if not m.get("ready") and m["ws_id"] != ws_id]
+    if _notready:
+        await send(ws_id, error(f"还有 {len(_notready)} 人没准备"))
+        return
+    room["in_game"] = True
+    room["n_players"] = n
+    room["last_active"] = time.time()
+    # ★ S6：先钉进房间，再广播**同一份** —— 别广播时现算一次、之后又现算一次，
+    #   那样「客户端看到的」与「服务端记的」就有了两个来源，早晚分叉。
+    room["seat_map"] = _seat_map(room, n)
+    await broadcast_to_room_all(code, pack(
+        type="game_start", n_players=n, host_ws_id=ws_id,
+        seat_map=room["seat_map"]))
+    print(f"[+] 房间 {code} 开局：{n} 人局，真人 {len(room['members'])} 个"
+          f"（AI 补 {n - len(room['members'])} 席）", flush=True)
 
 
 async def on_bubble(ws_id: str, msg: dict):
@@ -730,6 +1025,12 @@ HANDLERS = {
     "pvp_move":      on_pvp_move,
     "game_invite":   on_game_invite,
     "bubble":        on_bubble,
+    "ready":         lambda ws_id, msg: on_ready(ws_id, msg),
+    "start_game":    lambda ws_id, msg: on_start_game(ws_id, msg),
+    # S8：对局消息 —— 客户端↔权威。三条的收信人各不相同，服务端逐条查权限
+    "identity_action":  lambda ws_id, msg: on_identity_action(ws_id, msg),
+    "identity_state":   lambda ws_id, msg: on_identity_state(ws_id, msg),
+    "identity_private": lambda ws_id, msg: on_identity_private(ws_id, msg),
     "pvp_accept":    lambda ws_id, msg: on_pvp_accept(ws_id, msg),
     "pvp_decline":   lambda ws_id, msg: on_pvp_decline(ws_id, msg),
     "match_request": lambda ws_id, msg: on_match_request(ws_id, msg),
