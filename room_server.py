@@ -1,4 +1,4 @@
-﻿"""
+"""
 桌面勇者 —— 房间中转服务器
 职责：房间管理 + 消息转发（不处理游戏逻辑，仅做透明代理）
 
@@ -345,6 +345,7 @@ async def on_create(ws_id: str, msg: dict):
     rooms[code] = room
     conns[ws_id]["room"] = code
     conns[ws_id]["role"] = "host"
+    _sync_member_roles(room)          # ★ S9：room 建好之后立刻抄一份
     # `seat` 单独回一份：客户端要知道**自己**坐几号，
     # 而 `members` 一直是「不含自己」的列表，在里面找不到自己。
     await send(ws_id, pack(type="room_created", code=code, members=[], seat=seat))
@@ -380,6 +381,7 @@ async def on_join(ws_id: str, msg: dict):
     new_member = room["members"][-1]
     conns[ws_id]["room"] = code
     conns[ws_id]["role"] = "guest"
+    _sync_member_roles(room)          # ★ S9
 
     # 告诉加入者房间信息（不包括自己），以及**自己坐几号**
     others = [m for m in room["members"] if m["ws_id"] != ws_id]
@@ -396,6 +398,19 @@ def _host_of(room: dict) -> str:
         if conns.get(m["ws_id"], {}).get("role") == "host":
             return m["ws_id"]
     return ""
+
+
+def _authority_of(room: dict) -> str:
+    """本房**当前权威**的 ws_id（M2-d）。
+
+    开局时 = 房主；房主掉线后转给剩下的人 —— 那一刻「房主」与「权威」
+    才第一次分开（房主是**房间**的主人，权威是**这一局引擎**的持有者）。
+
+    ⚠️ 现读，不缓存。权威掉了要**回落到房主**：不然三条对局消息会**全都没人收**
+    （房主还在、却因为 `authority` 指着一条死连接而全体失声）。
+    """
+    a = room.get("authority")
+    return a if a and a in conns else (_host_of(room) or "")
 
 
 def _in_game_room(ws_id: str):
@@ -435,8 +450,8 @@ async def on_identity_action(ws_id: str, msg: dict):
     if not _same_room(ws_id, target):
         await _reject_cross_room(ws_id, target, "identity_action")
         return
-    if target != _host_of(room):
-        await send(ws_id, error("对局消息只能发给房主"))
+    if target != _authority_of(room):
+        await send(ws_id, error("对局消息只能发给当前权威"))
         return
     payload = {k: v for k, v in msg.items() if k not in ("type", "target_ws_id")}
     payload["from_ws_id"] = ws_id
@@ -458,8 +473,8 @@ async def on_identity_state(ws_id: str, msg: dict):
     if why:
         await send(ws_id, error(why))
         return
-    if ws_id != _host_of(room):
-        await send(ws_id, error("只有房主能广播对局状态"))
+    if ws_id != _authority_of(room):
+        await send(ws_id, error("只有当前权威能广播对局状态"))
         return
     payload = {k: v for k, v in msg.items() if k != "type"}
     payload["from_ws_id"] = ws_id
@@ -482,8 +497,8 @@ async def on_identity_private(ws_id: str, msg: dict):
     if why:
         await send(ws_id, error(why))
         return
-    if ws_id != _host_of(room):
-        await send(ws_id, error("只有房主能发私有信息"))
+    if ws_id != _authority_of(room):
+        await send(ws_id, error("只有当前权威能发私有信息"))
         return
     target = msg.get("target_ws_id", "")
     if not _same_room(ws_id, target):
@@ -493,6 +508,78 @@ async def on_identity_private(ws_id: str, msg: dict):
     payload["from_ws_id"] = ws_id
     _touch_room(ws_id)
     await send(target, pack(type="identity_private", **payload))
+
+
+async def _migrate_authority(code: str, room: dict, gone_ws: str) -> bool:
+    """★ M2-d：对局中**权威**离开 → 把这一局交给下一个在线的人。返回成不成。
+
+    ⚠️ 只有**服务端存着快照**时才做得成（权威每 0.5 秒推一份）。没有快照
+    （服务端刚重启 / 那一局还没推过第一份）就返回 False，由调用方退回老行为
+    「中止本局」—— **别假装能接手**。
+
+    ⚠️ 交出去的是**快照**，所以接手的那个人的机器上会**第一次**拥有
+    「全部身份 + 全部手牌」。这是方案 B 的信任边界的**必然扩张**：
+    能作弊的人从「房主」变成「房主 + 他掉线时的接任者」——
+    换来的是一局不会因为一个人拔网就作废。
+    ⚠️ 界面上那句披露（E7）说的是「房主」，权威迁移之后**要跟着改**。
+    """
+    snap = room.get("snapshot")
+    if not isinstance(snap, dict):
+        return False
+    _cand = [m for m in room["members"]
+             if not m.get("offline") and m["ws_id"] != gone_ws]
+    if not _cand:
+        return False
+    _next = min(_cand, key=lambda m: m["seat"])
+    _new_ws = _next["ws_id"]
+    _prev_seat = _seat_of_ws(room, gone_ws)
+    room["authority"] = _new_ws
+    conns[_new_ws]["role"] = "host"
+    _sync_member_roles(room)
+    room["last_active"] = time.time()
+    _seat = int(_next.get("seat") or 0)
+    await send(_new_ws, pack(
+        type="authority_granted", snapshot=snap, seat=_seat,
+        seat_map=_seat_map_now(room), n_players=room.get("n_players"),
+        # 新权威要把这几席交给 AI（含刚走的那个）—— 与 C11 同一个动作，
+        # 只是他知道的时机比 `member_offline` 早，所以在这里一并告诉他。
+        offline_seats=[int(m["seat"]) for m in room["members"] if m.get("offline")]
+                      + ([int(_prev_seat)] if _prev_seat else []),
+        prev_seat=int(_prev_seat)))
+    await broadcast_to_room_all(code, pack(
+        type="authority_changed", authority_ws_id=_new_ws, seat=_seat,
+        members=room["members"]))
+    print(f"[+] 权威迁移：{gone_ws} 离开 → {_new_ws} 接手（{_seat} 号位），"
+          f"对局继续", flush=True)
+    return True
+
+
+async def on_authority_snapshot(ws_id: str, msg: dict):
+    """★ M2-d：**权威**定期把整局快照推给服务端存着（服务端**不解析**它）。
+
+    为什么必须**定期推**、而不是掉线那一刻才算：房主拔网 = **他那一台的状态
+    已经没了** ——「掉线时再生成快照」物理上不可能。
+
+    为什么存服务端、而不是直接推给「下一任权威」：快照里有**全部身份与全部手牌**。
+    实时推给某个玩家 = 把能作弊的人从 1 个扩成 2 个（而且他在掉线前就能看了）；
+    给服务端则信任边界**一个字节都不变** —— 服务端拿到的是一份**不解析**的 blob，
+    这也不违反它「不跑游戏逻辑」的定位（它只是**存**，不是**算**）。
+
+    ⚠️ 只有**当前权威**能写。不查的话，任何客户端都能塞一份伪造的整局状态，
+    而掉线时新权威会**照着它复活这一局**。
+    """
+    code, room, why = _in_game_room(ws_id)
+    if why:
+        await send(ws_id, error(why))
+        return
+    if ws_id != _authority_of(room):
+        await send(ws_id, error("只有当前权威能提交对局快照"))
+        return
+    _snap = msg.get("snapshot")
+    if not isinstance(_snap, dict):
+        return
+    room["snapshot"] = _snap
+    _touch_room(ws_id)
 
 
 async def _abort_game_and_transfer_host(code: str, room: dict, gone_ws: str):
@@ -508,16 +595,37 @@ async def _abort_game_and_transfer_host(code: str, room: dict, gone_ws: str):
     引擎现成支持混合座位，对局**继续** —— 那条路不需要服务端做任何事，
     只要别解散房间就行，而大厅那条路本来就不解散。）
     """
+    # ⚠️⚠️ **先把走的人从成员表里摘掉**。
+    #    M2-d 之后，`on_leave` 的对局分支是「先试迁移、再走这里」—— 那条路
+    #    会**留着他等回座**（C12），所以走到「中止」这一条时他还在名单上。
+    #    不摘掉的话 `min(members)` 会选中**已经离开的那个人**当新房主，
+    #    然后广播一个指向死连接的 `host_ws_id`（实测：`verify_host_leave` 当场 8 条红）。
+    room["members"] = [m for m in room["members"] if m["ws_id"] != gone_ws]
     # 房间回到「可以用」的状态：剩下的人不用退房重进就能再开一局
     room["in_game"] = False
     room["n_players"] = None
     room["seat_map"] = None
+    room["authority"] = None       # ★ M2-d：别让下一局读到这一局的权威/快照
+    room["snapshot"] = None
+    # ★ 2026-08-16：**准备状态也要复位**。不复位的话，下一局谁都不用再准备
+    #   就能开 —— 而用户要的是「所有人都点了准备才能开」。
+    for _m in room["members"]:
+        _m["ready"] = False
     room["last_active"] = time.time()
     # 房主身份转移：交给**座位号最小**的剩下的人。
     # ⚠️ 别用「成员列表的第一个」—— 那个顺序取决于加入/离开的历史，
     #    同一个局面在不同机器上不一定一样；座位号是确定性的。
-    _next = min(room["members"], key=lambda m: m["seat"])
+    # ⚠️ S9：**必须排除掉线的人**（成员表会保留 offline 的人，C12 要认回座位）。
+    _alive = [m for m in room["members"] if not m.get("offline")]
+    if not _alive:
+        # 一个人都没了（只剩掉线的 ghost）→ 房间没用了
+        if not room["members"]:
+            del rooms[code]
+            print(f"[-] 房主 {gone_ws} 对局中离开 → 房间 {code} 空了，删除")
+        return
+    _next = min(_alive, key=lambda m: m["seat"])
     conns[_next["ws_id"]]["role"] = "host"
+    _sync_member_roles(room)          # ★ S9：转移也要抄进成员表
     # 先补一条 `member_left`（老客户端靠它清成员列表/收宠物），
     # 再发 `game_aborted`（新客户端靠它知道「本局没了、回大厅」）
     await broadcast_to_room_all(code, pack(type="member_left", ws_id=gone_ws,
@@ -536,10 +644,53 @@ async def on_leave(ws_id: str):
     code = c["room"]
     room = rooms.get(code)
     if not room:
+        # ★ 2026-08-16：房已经没了（比如刚被解散）——
+        #   **必须把自己那个悬空引用清掉**，否则这个人再也
+        #   建不了房、进不了房（「已在房间中」），而「退出房间」也救不了他
+        #   —— 两边都是这个早退，于是死锁。
+        c["room"] = None
+        c["role"] = None
         return
     role = c["role"]
     c["room"] = None; c["role"] = None
     _clear_battle(ws_id)
+
+    # ★ S9/C12（2026-10-15）：**对局中**不把成员删掉，只标 `offline`。
+    #
+    # 为什么：删了他就**认不回原座位**了 —— 重连时无据可查（`members` 里没有他，
+    # `seat_map` 里那条还指着一条已经不存在的 ws_id）。而「立刻托管 + 可回座」
+    # 这两条要求他的座位 / pet / 身份都留着。
+    #
+    # ⚠️ **大厅里维持原行为**（删 + `member_left`）：那里的语义就是「人走了」，
+    #    而且 `verify_room_lobby` / `verify_host_leave` 的断言靠它。
+    #
+    # ★ M2-d：房主（= 权威）在对局中离开，**先试权威迁移** —— 服务端存着他
+    #    定期推来的快照，交给座位号最小的另一个在线的人，这一局**接着打完**。
+    #    没有快照可交（服务端刚重启 / 那一局还没推过第一份）才退回老行为
+    #    「中止本局」—— **别假装能接手**。
+    if room.get("in_game"):
+        if role == "host" and not await _migrate_authority(code, room, ws_id):
+            await _abort_game_and_transfer_host(code, room, ws_id)
+            return
+        _seat = _seat_of_ws(room, ws_id)
+        for m in room["members"]:
+            if m["ws_id"] == ws_id:
+                m["offline"] = True
+                if m.get("role") == "host":
+                    # 权威已经交出去了，他回来是**普通成员**（C12 那条路能接住）
+                    m["role"] = "guest"
+        # 全掉光了 → 房间没用了（不留一间全是 ghost 的房）
+        if not any(not m.get("offline") for m in room["members"]):
+            del rooms[code]
+            print(f"[-] 房间 {code} 解散（对局中全体离线）")
+            return
+        room["last_active"] = time.time()
+        await broadcast_to_room_all(code, pack(type="member_offline", seat=_seat,
+                                               ws_id=ws_id,
+                                               members=room["members"]))
+        print(f"[-] {ws_id}({role}) 对局中掉线 → 房间 {code} 的 {_seat} 号位标记离线"
+              f"（成员保留，等他回座）")
+        return
 
     # 从成员列表移除
     room["members"] = [m for m in room["members"] if m["ws_id"] != ws_id]
@@ -559,6 +710,17 @@ async def on_leave(ws_id: str):
         # 大厅里房主离开：维持原行为（解散）—— S7 只改对局那一段，
         # 大厅的解散语义是既有的、已被客户端依赖的行为，不顺手改。
         await broadcast_to_room_all(code, pack(type="room_disbanded"))
+        # ★★ 2026-08-16（扫描挖出来的）：**必须把其余成员的 `conns[...]["room"]` 一起清掉**。
+        #   原来只删房，他们那一侧还指着一个**已经不存在的房号** →
+        #     · `create_room`/`join_room` 全被「已在房间中，请先离开」挡住；
+        #     · 而他们自己发 `leave_room` 时，`on_leave` 因为 `rooms.get(code)` 为
+        #       None **直接 return、一个字段都不清** → **死锁**，
+        #       除了重连**没有任何出路**（客户端只清自己那份，帮不上忙）。
+        for _m in list(room.get("members") or []):
+            _c = conns.get(_m.get("ws_id") or "")
+            if _c:
+                _c["room"] = None
+                _c["role"] = None
         del rooms[code]
         print(f"[-] 房主解散房间 {code}（通知{len(room['members'])}人退出）")
         return
@@ -598,7 +760,16 @@ def _new_room() -> dict:
             # S6：开局那一刻钉下来的座位表，**单一事实来源**。
             # `[{"seat":1,"ws_id":"..."} | {"seat":3,"ws_id":None}]`，
             # `ws_id is None` = 这一席由 AI 补位。
-            "seat_map": None}
+            "seat_map": None,
+            # ★ M2-d：**当前权威**的 ws_id。开局时 = 房主；房主掉线后转给
+            #   座位号最小的另一个在线的人（那时「房主」与「权威」才第一次分开）。
+            "authority": None,
+            # ★ M2-d：权威定期推来的**整局快照**（不解释的 blob）。
+            #   ⚠️ 存一份在服务端，而不是实时推给「下一任权威」——
+            #   快照里有**全部身份与全部手牌**，推给某个玩家等于把能作弊的人
+            #   从 1 个扩成 2 个（而且他在掉线前就能看了）。
+            #   给服务端则信任边界**一个字节都不变**（服务端不解析它）。
+            "snapshot": None}
 
 
 def _seat_map(room: dict, n_players: int) -> list:
@@ -689,7 +860,9 @@ def _add_member(room: dict, ws_id: str, pet) -> int:
     seat = _free_seat(room)
     if seat == 0:
         return 0
-    room["members"].append(_member(ws_id, pet, seat))
+    # ★ S9：`player_id` **从连接上读**，不从消息里读 —— 那是服务端自己的事实
+    _pid = (conns.get(ws_id) or {}).get("auth_player_id")
+    room["members"].append(_member(ws_id, pet, seat, player_id=_pid))
     room["last_active"] = time.time()
     return seat
 
@@ -712,7 +885,7 @@ def _make_match_room(pairs: list):
     return code, seats
 
 
-def _member(ws_id: str, pet, seat: int) -> dict:
+def _member(ws_id: str, pet, seat: int, player_id=None, role="guest") -> dict:
     """房间成员的结构 —— **只在这里定义一次**。
 
     建房 / 加入 / 匹配建房三处都要造它。散着写早晚有一处漏字段，
@@ -721,7 +894,31 @@ def _member(ws_id: str, pet, seat: int) -> dict:
     return {"ws_id": ws_id, "pet": pet, "joined_at": time.time(), "seat": seat,
             # S5：大厅里的「准备好了」。默认 False —— 让「没准备」是显式动作，
             # 而不是「没操作过也算准备」（后者在 4/5 人房里等于没有这个闸）
-            "ready": False}
+            "ready": False,
+            # ★ S9（M2）：**能在重连之后把人认回来的身份**。
+            #   `ws_id` 每次连接都重新随机（`new_id()`），拿它认不回原位；
+            #   `player_id` 来自 `conns[ws_id]["auth_player_id"]` —— 那是
+            #   `resume_session` **校验过 token** 才写上的，**绝不信客户端自报**。
+            "player_id": player_id,
+            # ★ S9：房主 / 普通成员。重连要把这个身份一起还回去 ——
+            #   那一刻旧的连接已经没了（`conns[old_ws_id]` 被 `finally` 清掉），
+            #   只能从成员表里读。
+            "role": role,
+            # ★ C12：断线中。**对局中**掉线不把人从成员表删掉，只标这个 ——
+            #   删了他就认不回原座位了。
+            "offline": False}
+
+
+def _sync_member_roles(room: dict) -> None:
+    """把 `conns[...]["role"]` 抄进成员表（S9）。
+
+    为什么要有这一步：`role` 原本**只**存在 `conns` 里，而重连时旧连接已经没了。
+    抄一份到成员表，`on_rejoin` 才能把身份还回去。
+    """
+    for m in room["members"]:
+        _r = (conns.get(m["ws_id"]) or {}).get("role")
+        if _r:
+            m["role"] = _r
 
 
 def _touch_room(ws_id: str) -> None:
@@ -903,6 +1100,8 @@ async def on_start_game(ws_id: str, msg: dict):
     # ★ S6：先钉进房间，再广播**同一份** —— 别广播时现算一次、之后又现算一次，
     #   那样「客户端看到的」与「服务端记的」就有了两个来源，早晚分叉。
     room["seat_map"] = _seat_map(room, n)
+    room["authority"] = ws_id              # ★ M2-d：开局时权威 = 房主
+    room["snapshot"] = None                # 上一局的快照不能留给这一局
     await broadcast_to_room_all(code, pack(
         type="game_start", n_players=n, host_ws_id=ws_id,
         seat_map=room["seat_map"]))
@@ -988,15 +1187,30 @@ async def on_match_request(ws_id: str, msg: dict):
             await send(peer_id, error("匹配失败：房间坐不下（服务端配置异常）"))
             return
         code, _seats = _made
+        # ★ 2026-08-16（扫描挖出来的）：**匹配建房也要登记 `battles`**。
+        #   原来只有好友邀请那条路（`on_pvp_accept`）写它，而
+        #   `on_game_invite` 的两道互斥守卫（「你正在对战中」/「对方正在对战」）
+        #   读的正是它 → **正在打匹配局的人仍可以被邀请、也能去邀请别人**，
+        #   两局叠在一起。
+        battles[peer_id] = ws_id
+        battles[ws_id] = peer_id
         conns[peer_id]["room"] = code
         conns[peer_id]["role"] = "host"
         conns[ws_id]["room"] = code
         conns[ws_id]["role"] = "guest"
+        _sync_member_roles(rooms[code])   # ★ S9
         seed = secrets.token_hex(3)
+        # ★ 2026-08-16：**把临时房的房间码也带上**。原来不带，客户端只好
+        #   `_room = msg.get("code", "match")` —— **凭空造一个叫 "match" 的房号**，
+        #   而它再没有地方会被清掉 → `in_room` 永久为真
+        #   （右键菜单一直多一项「退出房间」），而且重连时会去
+        #   `rejoin_room("match")`。给了真房号之后，匹配局重连也能认回座位。
         await send(peer_id, pack(type="match_found", game=game, is_host=True,
-                                 seat=_seats[peer_id], seed=seed, opponent=pet))
+                                 code=code, seat=_seats[peer_id], seed=seed,
+                                 opponent=pet))
         await send(ws_id, pack(type="match_found", game=game, is_host=False,
-                               seat=_seats[ws_id], seed=seed, opponent=peer_pet))
+                               code=code, seat=_seats[ws_id], seed=seed,
+                               opponent=peer_pet))
         print(f"[+] 匹配成功 {peer_id} vs {ws_id}（{game}）")
     else:
         # 入队等待
@@ -1031,6 +1245,10 @@ HANDLERS = {
     "identity_action":  lambda ws_id, msg: on_identity_action(ws_id, msg),
     "identity_state":   lambda ws_id, msg: on_identity_state(ws_id, msg),
     "identity_private": lambda ws_id, msg: on_identity_private(ws_id, msg),
+    # ★ S9/C12：重连回座（认人靠已认证的 player_id，不信客户端自报）
+    "rejoin_room":      lambda ws_id, msg: on_rejoin(ws_id, msg),
+    # ★ M2-d：权威定期推整局快照（服务端只存不解析）
+    "authority_snapshot": lambda ws_id, msg: on_authority_snapshot(ws_id, msg),
     "pvp_accept":    lambda ws_id, msg: on_pvp_accept(ws_id, msg),
     "pvp_decline":   lambda ws_id, msg: on_pvp_decline(ws_id, msg),
     "match_request": lambda ws_id, msg: on_match_request(ws_id, msg),
@@ -1094,6 +1312,76 @@ async def on_resume_session(ws_id: str, msg: dict):
     conns[ws_id]["auth_player_id"] = pid
     player_registry[pid] = ws_id
     await send(ws_id, pack(type="resume_result", ok=True, user_id=pid))
+
+
+async def on_rejoin(ws_id: str, msg: dict):
+    """★ S9/C12：**重连回座** —— 把断线的人放回他原来那一席。
+
+    三条硬要求，少一条这个口子就是敞开的：
+
+      · **必须已认证** —— 认人靠 `conns[ws_id]["auth_player_id"]`（那是
+        `resume_session` **校验过 token** 才写上的）。**绝不信客户端自报的 id**：
+        信了的话，任何人报一个 player_id 就能**顶掉别人的座位**，而身份局里
+        「坐到哪一席」就是「你是谁」。
+      · 房间必须**正在对局中** —— 大厅里没有「回座」这回事，重新 `join_room` 就行。
+      · 那个 player_id 必须**确实**是本房某条 `offline` 成员，否则明确拒绝
+        （**给回执**，不静默）。
+
+    ⚠️ 房主**不在**这条路上：对局中房主离开走 S7 的「中止本局」。等权威迁移
+    做完，房主也能回座 —— 那时这里按 `m["role"]` 把 host 身份一起还回去即可
+    （`role` 已经抄进成员表了，就是为那一刻留的）。
+    """
+    if conns[ws_id]["room"]:
+        await send(ws_id, error("已在房间中，请先离开"))
+        return
+    pid = conns[ws_id].get("auth_player_id")
+    if not pid:
+        await send(ws_id, pack(type="rejoin_result", ok=False,
+                               reason="未登录（重连回座要靠账号认人）"))
+        return
+    code = str(msg.get("code") or "").upper().strip()
+    room = rooms.get(code)
+    if not room:
+        # `gone` 让客户端知道「这间房没了」→ 它该把自己的 `_room` 清掉，
+        # 而不是留着一个陈旧值（那会让界面假装还在房里）。
+        await send(ws_id, pack(type="rejoin_result", ok=False, gone=True,
+                               reason="房间已经不在了"))
+        return
+    if not room.get("in_game"):
+        # `lobby` = 房间还在、只是不在对局里 → 客户端退回普通的 `join_room`
+        # （大厅里没有「回座」这回事，座位是重新分配的）。
+        await send(ws_id, pack(type="rejoin_result", ok=False, lobby=True,
+                               reason="这一局已经结束了"))
+        return
+    _m = next((m for m in room["members"]
+               if m.get("player_id") == pid and m.get("offline")), None)
+    if _m is None:
+        await send(ws_id, pack(type="rejoin_result", ok=False, lobby=True,
+                               reason="没有你的座位"))
+        return
+
+    _seat = int(_m.get("seat") or 0)
+    _m["ws_id"] = ws_id              # 换上新的连接
+    _m["offline"] = False
+    conns[ws_id]["room"] = code
+    conns[ws_id]["role"] = _m.get("role") or "guest"
+    # ⚠️ `seat_map` 里那条原来指着**旧的 ws_id** —— 不换的话，
+    #    S8 之后所有按座位号定向的消息都会发给一个不存在的连接（**静默丢失**）。
+    for _x in (room.get("seat_map") or []):
+        if int(_x.get("seat") or 0) == _seat:
+            _x["ws_id"] = ws_id
+    room["last_active"] = time.time()
+
+    await send(ws_id, pack(type="rejoin_result", ok=True, seat=_seat, code=code,
+                           role=conns[ws_id]["role"],
+                           # 房主的 ws_id 也一并回 —— 客户端要重建牌桌（上行发给谁）。
+                           # 原来它靠的是自己记的那份，重开进程就没了。
+                           host_ws_id=_host_of(room),
+                           n_players=room.get("n_players"),
+                           seat_map=_seat_map_now(room)))
+    await broadcast_to_room_all(code, pack(type="member_online", seat=_seat,
+                                           ws_id=ws_id, members=room["members"]))
+    print(f"[+] {ws_id} 重连回座 → 房间 {code} 的 {_seat} 号位")
 
 
 async def on_logout(ws_id: str, msg: dict):
