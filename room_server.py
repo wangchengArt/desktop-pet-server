@@ -966,6 +966,41 @@ async def _dispose_room(code: str, room: dict) -> None:
     print(f"[-] 房间 {code} 解散（通知{len(room.get('members') or [])}人退出）")
 
 
+async def on_game_over(ws_id: str, msg: dict):
+    """★ 2026-10-20：**这一局打完了** —— 房间回到大厅，可以重新准备、再开一局。
+
+    ⚠️ 为什么要这条消息：服务端不跑引擎，**永远不知道打完没有**，
+    于是 `in_game` 一直是 True —— 新人不许进、不能准备、不能再开局，
+    房间永久卡死。旧流程只能靠房主退出重建房间。
+
+    ⚠️ **只允许当前权威发**：服务端验不了「真打完了」，但至少不能让
+    任何一个客户端把整间房踢回大厅。
+    """
+    c = conns.get(ws_id)
+    if not c or not c["room"]:
+        await send(ws_id, error("不在房间中"))
+        return
+    code = c["room"]
+    room = rooms.get(code)
+    if not room:
+        return
+    if room.get("authority") != ws_id:
+        await send(ws_id, error("只有权威能宣布本局结束"))
+        return
+    room["in_game"] = False
+    room["n_players"] = 0
+    room["seat_map"] = None
+    room["authority"] = None
+    room["snapshot"] = None
+    for m in room["members"]:
+        m["ready"] = False          # 回大厅，所有人重新准备
+    await broadcast_to_room_all(code, pack(type="game_ended",
+        host_seat=int(next((m.get("seat") for m in room["members"]
+                            if m.get("role") == "host"), 0) or 0),
+        members=room["members"]))
+    print(f"[-] 房间 {code} 本局结束 → 回大厅", flush=True)
+
+
 async def on_disband_room(ws_id: str, msg: dict):
     """★ 2026-10-20：房主**显式解散**房间。
 
@@ -1314,6 +1349,8 @@ HANDLERS = {
     "start_game":    lambda ws_id, msg: on_start_game(ws_id, msg),
     # ★ 2026-10-20（用户 #6）：大厅「退出房间」= 转让房主，「解散房间」单独一条。
     "disband_room":  lambda ws_id, msg: on_disband_room(ws_id, msg),
+    # ★ 2026-10-20：一局正常打完 → 房间回大厅（否则永远卡在 in_game）
+    "game_over":     lambda ws_id, msg: on_game_over(ws_id, msg),
     # S8：对局消息 —— 客户端↔权威。三条的收信人各不相同，服务端逐条查权限
     "identity_action":  lambda ws_id, msg: on_identity_action(ws_id, msg),
     "identity_state":   lambda ws_id, msg: on_identity_state(ws_id, msg),
