@@ -632,6 +632,7 @@ async def _abort_game_and_transfer_host(code: str, room: dict, gone_ws: str):
                                            members=room["members"]))
     await broadcast_to_room_all(code, pack(type="game_aborted", reason="host_left",
                                            host_ws_id=_next["ws_id"],
+                                           host_seat=int(_next.get("seat") or 0),
                                            members=room["members"]))
     print(f"[-] 房主 {gone_ws} 对局中离开 → 房间 {code} 中止本局，"
           f"房主转给 {_next['ws_id']}（剩{len(room['members'])}人）", flush=True)
@@ -707,22 +708,27 @@ async def on_leave(ws_id: str):
         if room.get("in_game"):
             await _abort_game_and_transfer_host(code, room, ws_id)
             return
-        # 大厅里房主离开：维持原行为（解散）—— S7 只改对局那一段，
-        # 大厅的解散语义是既有的、已被客户端依赖的行为，不顺手改。
-        await broadcast_to_room_all(code, pack(type="room_disbanded"))
-        # ★★ 2026-08-16（扫描挖出来的）：**必须把其余成员的 `conns[...]["room"]` 一起清掉**。
-        #   原来只删房，他们那一侧还指着一个**已经不存在的房号** →
-        #     · `create_room`/`join_room` 全被「已在房间中，请先离开」挡住；
-        #     · 而他们自己发 `leave_room` 时，`on_leave` 因为 `rooms.get(code)` 为
-        #       None **直接 return、一个字段都不清** → **死锁**，
-        #       除了重连**没有任何出路**（客户端只清自己那份，帮不上忙）。
-        for _m in list(room.get("members") or []):
-            _c = conns.get(_m.get("ws_id") or "")
-            if _c:
-                _c["room"] = None
-                _c["role"] = None
-        del rooms[code]
-        print(f"[-] 房主解散房间 {code}（通知{len(room['members'])}人退出）")
+        # ★ 2026-10-20（用户 #6）：**大厅里房主退出 → 房主继承，不再解散**。
+        #   规则（用户已拍）：**2 号位优先**，2 号不在则按座位号从小到大
+        #   找第一个在线的人。只剩自己一人时上一步已经删房了。
+        _next = _inherit_host_seat(room)
+        if _next is None:
+            # 剩下的人都不可用（理论上到不了）→ 维持老行为：解散
+            await _dispose_room(code, room)
+            return
+        _new_ws = next((m["ws_id"] for m in room["members"]
+                        if int(m.get("seat") or 0) == _next), "")
+        _c = conns.get(_new_ws)
+        if _c:
+            _c["role"] = "host"
+        _sync_member_roles(room)
+        # 先广播「有人走了」（旧客户端靠它清好友宠物/列表），再广播「谁接了房主」。
+        await broadcast_to_room_all(code, pack(type="member_left", ws_id=ws_id,
+            members=room["members"]))
+        await broadcast_to_room_all(code, pack(type="host_changed",
+            host_seat=_next, host_ws_id=_new_ws, members=room["members"],
+            in_game=False))
+        print(f"[+] 房主离开 {code} → 房主转给 {_next} 号位（{_new_ws}）")
         return
 
     # 普通成员离开：通知其他人
@@ -919,6 +925,71 @@ def _sync_member_roles(room: dict) -> None:
         _r = (conns.get(m["ws_id"]) or {}).get("role")
         if _r:
             m["role"] = _r
+
+
+def _inherit_host_seat(room: dict):
+    """大厅房主退出时，**谁接房主**（用户 2026-10-20 #6）。
+
+    规则：**2 号位优先**；2 号位不在（或已掉线）则按座位号从小到大
+    找第一个在线的人。返回座位号，没有可用的人返回 None。
+
+    ⚠️ 为什么不直接「取最小座位号」：用户明确要 2 号优先。两者在
+    「2 号还在」时结果相同，不同的是 2 号早退之后 —— 取最小号会选 3 号，
+    这正好也是用户接受的递推规则。所以「2 号优先 + 最小号兜底」写成一条
+    即可，但**先判 2 号**是明确的意图，别在将来被"优化"掉。
+    """
+    _alive = [m for m in room["members"] if not m.get("offline")]
+    if not _alive:
+        return None
+    for m in _alive:
+        if int(m.get("seat") or 0) == 2:
+            return 2
+    return min(int(m.get("seat") or 0) for m in _alive)
+
+
+async def _dispose_room(code: str, room: dict) -> None:
+    """**真正解散**一个房间：通知 + 清掉所有成员的房间引用 + 删房。
+
+    ★ 2026-10-20 抽出：原来这段只写在 `on_leave` 的大厅房主分支里。
+    现在「房主退出」变成了**继承**，解散只剩两条路（只剩自己 / 显式解散），
+    两处必须走同一段清理 —— 尤其 `conns[...]["room"]` 那条：
+    不清的话他们发 `leave_room` 时 `rooms.get(code)` 为 None **直接 return**，
+    一个字段都不清 → **死锁**（除了重连没有任何出路）。
+    """
+    await broadcast_to_room_all(code, pack(type="room_disbanded"))
+    for _m in list(room.get("members") or []):
+        _c = conns.get(_m.get("ws_id") or "")
+        if _c:
+            _c["room"] = None
+            _c["role"] = None
+    rooms.pop(code, None)
+    print(f"[-] 房间 {code} 解散（通知{len(room.get('members') or [])}人退出）")
+
+
+async def on_disband_room(ws_id: str, msg: dict):
+    """★ 2026-10-20：房主**显式解散**房间。
+
+    ⚠️ 为什么需要单独一条消息：`#6` 让「房主离开」变成「转让房主」之后，
+    如果「解散」还复用 `leave_room`，房主就**再也没有办法解散房间**了。
+    客户端把「解散房间」按钮指向这里，把「退出房间」指向 `leave_room`。
+    """
+    c = conns.get(ws_id)
+    if not c or not c["room"]:
+        await send(ws_id, error("不在房间中"))
+        return
+    code = c["room"]
+    room = rooms.get(code)
+    if not room:
+        await send(ws_id, error("房间不存在"))
+        return
+    if c.get("role") != "host":
+        await send(ws_id, error("只有房主能解散房间"))
+        return
+    if room.get("in_game"):
+        # 对局中解散 → 先让所有人回到大厅语义，再解散
+        await broadcast_to_room_all(code, pack(type="game_aborted",
+            reason="host_disband", members=room["members"]))
+    await _dispose_room(code, room)
 
 
 def _touch_room(ws_id: str) -> None:
@@ -1241,6 +1312,8 @@ HANDLERS = {
     "bubble":        on_bubble,
     "ready":         lambda ws_id, msg: on_ready(ws_id, msg),
     "start_game":    lambda ws_id, msg: on_start_game(ws_id, msg),
+    # ★ 2026-10-20（用户 #6）：大厅「退出房间」= 转让房主，「解散房间」单独一条。
+    "disband_room":  lambda ws_id, msg: on_disband_room(ws_id, msg),
     # S8：对局消息 —— 客户端↔权威。三条的收信人各不相同，服务端逐条查权限
     "identity_action":  lambda ws_id, msg: on_identity_action(ws_id, msg),
     "identity_state":   lambda ws_id, msg: on_identity_state(ws_id, msg),
