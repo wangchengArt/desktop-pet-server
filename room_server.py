@@ -89,9 +89,15 @@ battles: dict[str, str] = {}   # 对战中的玩家 ws_id → 对手 ws_id
 # ── 随机匹配队列 ─────────────────────────────────────────
 # 真人对战只做弱鸡对决，匹配队列固定用这一个 key（见 on_match_request）。
 MATCH_GAME = "weak"
-match_queues: dict[str, list] = {}   # {game_type: [ws_id, ...]}
-match_pets: dict[str, dict] = {}     # {ws_id: pet_info} 排队中的宠物信息
-match_ctx: dict[str, str] = {}       # {ws_id: game_type} 排队状态
+# ★ 2026-10-21（用户）：真人对战匹配分 2 / 4 / 5 人局。
+#   · 2 人局 = 弱鸡对决 1v1；
+#   · 4 / 5 人局 = 弱鸡杀身份局（匹配凑齐人数即开局，不需要大厅准备）。
+MATCH_SIZES = (2, 4, 5)
+# 队列按 **(game, n_players)** 分桶 —— 只按 game 分的话，2 人局和 5 人局
+# 会混进同一条队列：要么两个人就被凑成一局，要么永远等不到足够的人。
+match_queues: dict[tuple, list] = {}   # {(game, n_players): [ws_id, ...]}
+match_pets: dict[str, dict] = {}       # {ws_id: pet_info} 排队中的宠物信息
+match_ctx: dict[str, tuple] = {}       # {ws_id: (game, n_players)} 排队状态
 
 # ── 数据根目录：打包后放 exe 同目录，开发时在 server/，保证跨重启持久化 ──
 def _data_base() -> str:
@@ -1256,82 +1262,112 @@ async def on_pvp_decline(ws_id: str, msg: dict):
 
 # ── 随机匹配 ──────────────────────────────────────────────
 async def on_match_request(ws_id: str, msg: dict):
-    """加入匹配队列，若已有同类型等待者则配对
+    """加入匹配队列，凑够人数就配对
+
+    ★ 2026-10-21（用户）：支持 **2 / 4 / 5 人局**。
+
+    队列按 **(game, n_players)** 分桶：
+      · 2 人局 → 两个人配对，沿用原来的 1v1 流程（只发 `match_found`）；
+      · 4 / 5 人局 → 凑够 N 个人后建临时房，**匹配即开局**：
+        直接广播 `game_start`（带 seat_map / members），房主端建身份局会话。
 
     ⚠️ `game` **一律强制为弱鸡对决，不接受客户端指定**。
-    队列是按 game 分桶的，放任客户端自报 game 会把玩家池静默拆开：
-    报 "rps" 的人只会和同样报 "rps" 的人配对，而客户端本来就只有弱鸡这一个
-    匹配入口 —— 结果是双方各自排队、谁也等不到人，还看不出是坏了。
-    真人对战目前只做弱鸡对决，所以这里不需要那个自由度。
+    放任客户端自报 game 会把玩家池静默拆开：报 "rps" 的人只会和同样报
+    "rps" 的人配对，而客户端本来就只有弱鸡这一个匹配入口 —— 结果是双方
+    各自排队、谁也等不到人，还看不出是坏了。人数则是**玩法本身**的选项
+    （1v1 vs 4/5 人身份局），必须由客户端指定，但只接受白名单里的值。
     """
     game = MATCH_GAME
     pet = msg.get("pet", {})
+    try:
+        n = int(msg.get("n_players") or 2)
+    except (TypeError, ValueError):
+        n = 2
+    if n not in MATCH_SIZES:
+        await send(ws_id, error("人数只能是 2 / 4 / 5"))
+        return
     if ws_id in match_ctx:
         return  # 已在匹配中
     if conns[ws_id].get("room"):
         await send(ws_id, error("已在房间中，请先离开"))
         return
-    q = match_queues.setdefault(game, [])
-    if q:
-        # 有人等待 → 配对
-        peer_id = q.pop(0)
-        match_ctx.pop(peer_id, None)
+    key = (game, n)
+    q = match_queues.setdefault(key, [])
+    # 队列保洁：等待期间有人进了房间 / 断线了，就不能再算进这一局
+    q = [x for x in q if x in conns and not conns[x].get("room")]
+    match_queues[key] = q
+    if len(q) >= n - 1:
+        # 凑够了 → 取最早的 n-1 个人，再把当前这个人补成最后一席
+        peer_ids = [q.pop(0) for _ in range(n - 1)]
+        pairs = [(pid, match_pets.pop(pid, {})) for pid in peer_ids]
+        for pid in peer_ids:
+            match_ctx.pop(pid, None)
         match_ctx.pop(ws_id, None)
-        peer_pet = match_pets.pop(peer_id, {})
         match_pets.pop(ws_id, None)
-        # 建立临时对战房间，复用 pvp_move 广播
-        # ★ S4：走 `_make_match_room`（内部 `_add_member`）—— 原来这里是
-        #   **直接构造 members 列表**的，绕过了 `MAX_PLAYERS`。2 人匹配看不出问题，
-        #   将来做 N 人匹配时那一处忘了判就会静默超员。
-        _made = _make_match_room([(peer_id, peer_pet), (ws_id, pet)])
+        pairs.append((ws_id, pet))
+        # 建立临时对战房间（S4：走 `_make_match_room` → `_add_member`，
+        # 不绕过 `MAX_PLAYERS`；N 人局坐不下时宁可明确报错，也不静默超员）
+        _made = _make_match_room(pairs)
         if _made is None:
-            # 坐不下 → **不能开局，也不能静默超员**。理论上到不了（2 < MAX_PLAYERS），
-            # 但真到了多半是 `MAX_PLAYERS` 被配小了，宁可两边都收到明确错误。
             print(f"[!] 匹配建房失败：坐不下（MAX_PLAYERS={MAX_PLAYERS}）"
-                  f" {peer_id} vs {ws_id}", flush=True)
-            await send(ws_id, error("匹配失败：房间坐不下（服务端配置异常）"))
-            await send(peer_id, error("匹配失败：房间坐不下（服务端配置异常）"))
+                  f" {n} 人局 {[p[0] for p in pairs]}", flush=True)
+            for pid, _ in pairs:
+                await send(pid, error("匹配失败：房间坐不下（服务端配置异常）"))
             return
         code, _seats = _made
-        # ★ 2026-08-16（扫描挖出来的）：**匹配建房也要登记 `battles`**。
-        #   原来只有好友邀请那条路（`on_pvp_accept`）写它，而
-        #   `on_game_invite` 的两道互斥守卫（「你正在对战中」/「对方正在对战」）
-        #   读的正是它 → **正在打匹配局的人仍可以被邀请、也能去邀请别人**，
-        #   两局叠在一起。
-        battles[peer_id] = ws_id
-        battles[ws_id] = peer_id
-        conns[peer_id]["room"] = code
-        conns[peer_id]["role"] = "host"
-        conns[ws_id]["room"] = code
-        conns[ws_id]["role"] = "guest"
-        _sync_member_roles(rooms[code])   # ★ S9
+        room = rooms[code]
+        host_ws = pairs[0][0]          # 最早进队的人坐 1 号、当房主
+        if n >= 4:
+            # 身份局：匹配本身就是「准备」，直接钉座位表并开局
+            room["in_game"] = True
+            room["n_players"] = n
+            room["seat_map"] = _seat_map(room, n)
+            room["authority"] = host_ws
+            room["snapshot"] = None
+        else:
+            # 1v1：沿用原来的 `battles` 登记（邀请互斥守卫读它）
+            a, b = pairs[0][0], pairs[1][0]
+            battles[a] = b
+            battles[b] = a
+        for pid, _ in pairs:
+            conns[pid]["room"] = code
+            conns[pid]["role"] = "host" if pid == host_ws else "guest"
+        _sync_member_roles(room)       # ★ S9
         seed = secrets.token_hex(3)
-        # ★ 2026-08-16：**把临时房的房间码也带上**。原来不带，客户端只好
-        #   `_room = msg.get("code", "match")` —— **凭空造一个叫 "match" 的房号**，
-        #   而它再没有地方会被清掉 → `in_room` 永久为真
-        #   （右键菜单一直多一项「退出房间」），而且重连时会去
-        #   `rejoin_room("match")`。给了真房号之后，匹配局重连也能认回座位。
-        await send(peer_id, pack(type="match_found", game=game, is_host=True,
-                                 code=code, seat=_seats[peer_id], seed=seed,
-                                 opponent=pet))
-        await send(ws_id, pack(type="match_found", game=game, is_host=False,
-                               code=code, seat=_seats[ws_id], seed=seed,
-                               opponent=peer_pet))
-        print(f"[+] 匹配成功 {peer_id} vs {ws_id}（{game}）")
+        for pid, pt in pairs:
+            opponent = {}
+            if n == 2:
+                opponent = pairs[1][1] if pid == host_ws else pairs[0][1]
+            # ★ 2026-08-16：**把临时房的房间码也带上**（重连能认回座位）。
+            await send(pid, pack(type="match_found", game=game,
+                                 is_host=(pid == host_ws), code=code,
+                                 seat=_seats[pid], seed=seed,
+                                 n_players=n, opponent=opponent))
+        if n >= 4:
+            # 身份局：房主/客人随后走 `_on_net_game_start` 那条既有路径
+            await broadcast_to_room_all(code, pack(
+                type="game_start", n_players=n, host_ws_id=host_ws,
+                seat_map=room["seat_map"], members=room["members"]))
+            print(f"[+] 匹配成功（{n} 人身份局）{code}："
+                  f"{[p[0] for p in pairs]}", flush=True)
+        else:
+            print(f"[+] 匹配成功 {pairs[0][0]} vs {pairs[1][0]}（{game}）",
+                  flush=True)
     else:
         # 入队等待
         q.append(ws_id)
-        match_ctx[ws_id] = game
+        match_ctx[ws_id] = key
         match_pets[ws_id] = pet
-        await send(ws_id, pack(type="match_waiting", game=game))
-        print(f"[*] {ws_id} 进入匹配队列（{game}），等待对手")
+        await send(ws_id, pack(type="match_waiting", game=game, n_players=n))
+        print(f"[*] {ws_id} 进入匹配队列（{game} / {n} 人），"
+              f"等待对手（{len(q)}/{n}）", flush=True)
 
 
 async def on_match_cancel(ws_id: str, msg: dict):
     """取消匹配"""
-    game = match_ctx.pop(ws_id, None)
-    if game and ws_id in match_queues.get(game, []):
-        match_queues[game].remove(ws_id)
+    key = match_ctx.pop(ws_id, None)
+    if key and ws_id in match_queues.get(key, []):
+        match_queues[key].remove(ws_id)
     match_pets.pop(ws_id, None)
     await send(ws_id, pack(type="match_canceled"))
 
