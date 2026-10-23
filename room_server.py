@@ -150,10 +150,124 @@ def _save_coin_audit(token: str, audit: dict):
         pass
 
 
+# ── 服务端资产：仓库 / 装备（★ 2026-10-23 Phase 1）────────────────────
+# 这些键**只由服务端写**：
+#   · `sync_upload` 不再接受客户端上传的它们（旧值保留）；
+#   · 变动走 `inv_shop_buy` / `inv_add` / `inv_remove` / `inv_equip` / `inv_unequip`；
+#   · `inv_state` 把最新状态回给本人。
+# 装备/仓库因此在「在线 + 已登录」时以服务端为准；离线本地缓存会在下次登录被覆盖
+# （用户 2026-10-23 选的口径）。
+SERVER_INV_KEYS = ("owned_items", "skin_chick", "skin_luobo",
+                   "nest", "equip_nest", "deco_1", "deco_2", "deco_3")
+INV_EQUIP_SLOTS = ("skin_chick", "skin_luobo", "nest",
+                   "deco_1", "deco_2", "deco_3")
+# 允许客户端上报的产出来源（服务端只校验「物品 ID 存在」，不跑 RNG/奖池；
+# 这是 Phase 1 的已知边界，见 `on_inv_add` 的说明）。
+INV_ADD_REASONS = frozenset({
+    "gacha", "lottery", "realm", "minigame", "food", "shop_food",
+    "boss", "signin", "reward", "gm",
+})
+INV_REMOVE_REASONS = frozenset({"lottery", "food", "consume"})
+INV_QTY_MAX = 99
+
+
+def _catalog_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "item_catalog.json")
+
+
+def _load_catalog() -> dict:
+    try:
+        with open(_catalog_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+ITEM_CATALOG = _load_catalog()
+
+
+def parse_owned(raw) -> dict:
+    """`id:qty,id:qty`（也兼容旧格式 `id,id`）→ `{id: qty}`。"""
+    out = {}
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            iid, qty = part.split(":", 1)
+            try:
+                q = int(qty)
+            except ValueError:
+                q = 1
+        else:
+            iid, q = part, 1
+        if iid and q > 0:
+            out[iid] = out.get(iid, 0) + q
+    return out
+
+
+def fmt_owned(owned: dict) -> str:
+    return ",".join(f"{iid}:{int(q)}" for iid, q in sorted(owned.items())
+                    if int(q) > 0)
+
+
+def inv_snapshot(save: dict, coin_delta: int = 0) -> dict:
+    """回给客户端的**服务端权威**仓库/装备 + 金币修订号。
+
+    `coin_delta`：**本次操作**引起的金币变化（商城购买为负）。客户端按修订号
+    只应用一次；不要用 `coins` 绝对值覆盖本地 —— 本地可能刚领了奖励还没上传。
+    """
+    return {
+        "owned_items": fmt_owned(parse_owned(save.get("owned_items", ""))),
+        "skin_chick": str(save.get("skin_chick", "") or ""),
+        "skin_luobo": str(save.get("skin_luobo", "") or ""),
+        "nest": str(save.get("nest", "") or save.get("equip_nest", "") or ""),
+        "deco_1": str(save.get("deco_1", "") or ""),
+        "deco_2": str(save.get("deco_2", "") or ""),
+        "deco_3": str(save.get("deco_3", "") or ""),
+        "coins": int(save.get("coins", 0) or 0),
+        "coins_delta": int(coin_delta or 0),
+        "shop_rev": int(save.get("shop_rev", 0) or 0),
+        "_ts": float(save.get("_ts", 0) or 0),
+    }
+
+
+def _write_save(token: str, data: dict) -> bool:
+    data["_ts"] = time.time()
+    try:
+        with open(_save_path(token), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except Exception:
+        return False
+    return True
+
+
 def cloud_save(token: str, data: dict, skip_check: bool = False) -> bool:
-    """保存存档，带金币异常增长检测；返回是否成功保存"""
-    new_coins = int(data.get("coins", 0) or 0)
+    """保存存档，带金币异常增长检测；返回是否成功保存。
+
+    ★ 2026-10-23：**仓库 / 装备是服务端资产** —— 普通客户端上传时，
+      这几个键一律用服务器已有的值覆盖（客户端不能直接改）。
+      只有 GM（`skip_check=True`）和 `inv_*` 处理器（走 `_write_save`）能改。
+    ★ `shop_rev`：服务端商城购买的修订号。客户端如果上传了一个**更旧**的
+      修订号（还没收到/应用服务端的扣费回包），它的金币也不能覆盖服务端的
+      扣费结果 —— 否则「买完马上触发一次云上传」会把金币退回去。
+    """
     old = cloud_load(token)
+    if not skip_check:
+        for k in SERVER_INV_KEYS:
+            if k in old:
+                data[k] = old[k]
+            else:
+                data.pop(k, None)
+        _crev = int(data.get("shop_rev", 0) or 0)
+        _srev = int(old.get("shop_rev", 0) or 0)
+        if _crev < _srev:
+            data["coins"] = old.get("coins", data.get("coins", 0))
+        data["shop_rev"] = str(max(_crev, _srev))
+
+    new_coins = int(data.get("coins", 0) or 0)
     old_coins = int(old.get("coins", 0) or 0)
     delta = new_coins - old_coins
     now = time.time()
@@ -178,13 +292,7 @@ def cloud_save(token: str, data: dict, skip_check: bool = False) -> bool:
         audit["large_count"] = large_count
         _save_coin_audit(token, audit)
 
-    data["_ts"] = now
-    try:
-        with open(_save_path(token), "w", encoding="utf-8") as f:
-            json.dump(data, f)
-    except Exception:
-        return False
-    return True
+    return _write_save(token, data)
 
 
 def cloud_load(token: str) -> dict:
@@ -193,6 +301,40 @@ def cloud_load(token: str) -> dict:
             return json.load(f)
     except Exception:
         return {}
+
+
+def equipped_from_save(data: dict) -> dict:
+    """从云存档里取**已装备、且确实在 `owned_items` 里**的条目。
+
+    ★ 2026-10-22：联机首饰暴击改成「房主向服务端要真实装备」——
+      服务端只负责从**它自己存着的云存档**里读出这几个键，
+      不解析装备属性、也不跑任何游戏规则（属性换算仍由房主用客户端同一份
+      `shop.ITEMS` 做）。这样：
+        · 客人不能再自报一个「我有 +40% 暴击」；
+        · 服务端仍不碰卡牌/回合/身份等游戏规则。
+    ⚠️ 云存档是客户端上传的 —— 它代表**账号最后一次上传的存档**，
+      比客户端在对局里现发的可信；但改了本地存档再上传仍然能伪造。
+      真要做到「服务器完全权威」，得把仓库/装备也搬成服务端资产。
+    """
+    owned_raw = str(data.get("owned_items", "") or "")
+    owned = set()
+    for part in owned_raw.split(","):
+        part = part.strip()
+        if part:
+            owned.add(part.split(":", 1)[0])
+
+    def _eq(key: str) -> str:
+        val = str(data.get(key, "") or "")
+        return val if val in owned else ""
+
+    return {
+        "skin_chick": _eq("skin_chick"),
+        "skin_luobo": _eq("skin_luobo"),
+        "nest": _eq("nest") or _eq("equip_nest"),
+        "deco_1": _eq("deco_1"),
+        "deco_2": _eq("deco_2"),
+        "deco_3": _eq("deco_3"),
+    }
 
 
 def _session_path(token: str) -> str:
@@ -1007,6 +1149,240 @@ async def on_game_over(ws_id: str, msg: dict):
     print(f"[-] 房间 {code} 本局结束 → 回大厅", flush=True)
 
 
+async def on_crit_stats_request(ws_id: str, msg: dict):
+    """★ 2026-10-22：**权威**向服务端要本房各真人的装备暴击。
+
+    只回**已装备的条目 ID**（以及 `owned_items` 里确实拥有的校验），
+    不回金币、仓库、卡组等其它存档内容；属性换算由房主用客户端同一份
+    `shop.ITEMS` 做 —— 服务端仍不解析游戏规则。
+    """
+    code, room, why = _in_game_room(ws_id)
+    if why:
+        await send(ws_id, error(why))
+        return
+    if ws_id != _authority_of(room):
+        await send(ws_id, error("只有当前权威能查询装备"))
+        return
+    out = {}
+    for m in room["members"]:
+        pid = str(m.get("player_id") or "")
+        seat = int(m.get("seat") or 0)
+        if not pid or not seat:
+            continue
+        out[str(seat)] = equipped_from_save(cloud_load(pid))
+    # `gen` 原样回传 —— 客户端用它丢掉上一局迟到的回包
+    await send(ws_id, pack(type="crit_stats", gen=msg.get("gen", 0), stats=out))
+
+
+# ══════════════════════════════════════════════════════════════
+#  服务端资产：仓库 / 装备（Phase 1，2026-10-23）
+# ══════════════════════════════════════════════════════════════
+#
+# 职责边界：
+#   · 服务端**拥有** `owned_items` 与装备槽；客户端上传的这两类字段一律被忽略。
+#   · 装备/卸下、商城购买由服务端校验后写入。
+#   · 抽奖/秘境/小游戏/食物等产出仍由客户端决定，通过 `inv_add(reason=…)`
+#     上报；服务端只校验**物品 ID 存在**、数量/来源合法，不跑 RNG。
+#     ⇒ Phase 1 能堵「上传伪造整份仓库」，堵不住「伪造一次产出」；
+#       完整经济服务端化是 Phase 2。
+#
+# 离线口径（用户 2026-10-23 选）：**在线以服务端为准，离线本地缓存**。
+# 离线改动不会上报；下次登录 `sync_download` 用服务端状态覆盖。
+
+def _inv_pid(ws_id: str) -> str:
+    return str((conns.get(ws_id) or {}).get("auth_player_id") or "")
+
+
+async def _inv_reply(ws_id: str, save: dict, err: str = "",
+                     coin_delta: int = 0) -> None:
+    await send(ws_id, pack(type="inv_state",
+                           data=inv_snapshot(save, coin_delta=coin_delta),
+                           error=err))
+
+
+def _equip_slot_for(item_id: str, slot: str):
+    """校验「物品能不能装进这个槽」；返回 (ok, err)。"""
+    it = ITEM_CATALOG.get(item_id)
+    if it is None:
+        return False, "unknown_item"
+    cat = it.get("cat", "")
+    if cat == "skin":
+        if slot != f"skin_{it.get('pet', 'chick')}":
+            return False, "cat_mismatch"
+    elif cat == "nest":
+        if slot != "nest":
+            return False, "cat_mismatch"
+    elif cat == "decoration":
+        if slot not in ("deco_1", "deco_2", "deco_3"):
+            return False, "cat_mismatch"
+    else:
+        return False, "cat_mismatch"
+    return True, ""
+
+
+async def on_inv_shop_buy(ws_id: str, msg: dict):
+    """商城购买：服务端扣金币 + 加物品（唯一付费入口）。"""
+    pid = _inv_pid(ws_id)
+    if not pid:
+        await send(ws_id, pack(type="inv_state", data={}, error="no_auth"))
+        return
+    save = cloud_load(pid)
+    if not ITEM_CATALOG:
+        await _inv_reply(ws_id, save, "catalog_missing")
+        return
+    item_id = str(msg.get("item_id") or "")
+    it = ITEM_CATALOG.get(item_id)
+    if it is None:
+        await _inv_reply(ws_id, save, "unknown_item")
+        return
+    if it.get("cat") == "decoration":
+        await _inv_reply(ws_id, save, "not_for_sale")
+        return
+    owned = parse_owned(save.get("owned_items", ""))
+    if it.get("cat") != "food" and owned.get(item_id, 0) > 0:
+        await _inv_reply(ws_id, save, "owned")
+        return
+    price = max(0, int(it.get("price", 0) or 0))
+    coins = int(save.get("coins", 0) or 0)
+    if coins < price:
+        await _inv_reply(ws_id, save, "no_coins")
+        return
+    save["coins"] = str(coins - price)
+    owned[item_id] = owned.get(item_id, 0) + 1
+    save["owned_items"] = fmt_owned(owned)
+    save["shop_rev"] = int(save.get("shop_rev", 0) or 0) + 1
+    if not _write_save(pid, save):
+        await _inv_reply(ws_id, cloud_load(pid), "save_failed")
+        return
+    print(f"[INV] {pid} 商城购买 {item_id} -{price} 金币", flush=True)
+    await _inv_reply(ws_id, save, coin_delta=-price)
+
+
+async def on_inv_add(ws_id: str, msg: dict):
+    """非商城产出：校验物品/数量/来源后加进服务端仓库。"""
+    pid = _inv_pid(ws_id)
+    if not pid:
+        await send(ws_id, pack(type="inv_state", data={}, error="no_auth"))
+        return
+    item_id = str(msg.get("item_id") or "")
+    reason = str(msg.get("reason") or "reward")
+    try:
+        qty = int(msg.get("qty", 1) or 1)
+    except (TypeError, ValueError):
+        qty = 0
+    save = cloud_load(pid)
+    if not ITEM_CATALOG:
+        await _inv_reply(ws_id, save, "catalog_missing")
+        return
+    if item_id not in ITEM_CATALOG:
+        await _inv_reply(ws_id, save, "unknown_item")
+        return
+    if reason not in INV_ADD_REASONS:
+        await _inv_reply(ws_id, save, "bad_reason")
+        return
+    _cat = ITEM_CATALOG[item_id].get("cat", "")
+    if reason in ("food", "shop_food") and _cat != "food":
+        await _inv_reply(ws_id, save, "bad_reason")
+        return
+    if reason == "boss" and _cat != "decoration":
+        await _inv_reply(ws_id, save, "bad_reason")
+        return
+    if not (1 <= qty <= INV_QTY_MAX):
+        await _inv_reply(ws_id, save, "bad_qty")
+        return
+    owned = parse_owned(save.get("owned_items", ""))
+    owned[item_id] = owned.get(item_id, 0) + qty
+    save["owned_items"] = fmt_owned(owned)
+    if not _write_save(pid, save):
+        await _inv_reply(ws_id, cloud_load(pid), "save_failed")
+        return
+    print(f"[INV] {pid} +{qty}×{item_id} ({reason})", flush=True)
+    await _inv_reply(ws_id, save)
+
+
+async def on_inv_remove(ws_id: str, msg: dict):
+    """消耗物品：校验拥有数量后从服务端仓库扣除。"""
+    pid = _inv_pid(ws_id)
+    if not pid:
+        await send(ws_id, pack(type="inv_state", data={}, error="no_auth"))
+        return
+    item_id = str(msg.get("item_id") or "")
+    reason = str(msg.get("reason") or "consume")
+    try:
+        qty = int(msg.get("qty", 1) or 1)
+    except (TypeError, ValueError):
+        qty = 0
+    save = cloud_load(pid)
+    if reason not in INV_REMOVE_REASONS:
+        await _inv_reply(ws_id, save, "bad_reason")
+        return
+    if not (1 <= qty <= INV_QTY_MAX):
+        await _inv_reply(ws_id, save, "bad_qty")
+        return
+    owned = parse_owned(save.get("owned_items", ""))
+    if owned.get(item_id, 0) < qty:
+        await _inv_reply(ws_id, save, "not_owned")
+        return
+    owned[item_id] -= qty
+    save["owned_items"] = fmt_owned(owned)
+    if not _write_save(pid, save):
+        await _inv_reply(ws_id, cloud_load(pid), "save_failed")
+        return
+    print(f"[INV] {pid} -{qty}×{item_id} ({reason})", flush=True)
+    await _inv_reply(ws_id, save)
+
+
+async def on_inv_equip(ws_id: str, msg: dict):
+    """装备到某个槽：服务端校验「拥有 + 槽位/类别匹配」后写入。"""
+    pid = _inv_pid(ws_id)
+    if not pid:
+        await send(ws_id, pack(type="inv_state", data={}, error="no_auth"))
+        return
+    slot = str(msg.get("slot") or "")
+    item_id = str(msg.get("item_id") or "")
+    save = cloud_load(pid)
+    if slot not in INV_EQUIP_SLOTS:
+        await _inv_reply(ws_id, save, "bad_slot")
+        return
+    owned = parse_owned(save.get("owned_items", ""))
+    if owned.get(item_id, 0) <= 0:
+        await _inv_reply(ws_id, save, "not_owned")
+        return
+    ok, err = _equip_slot_for(item_id, slot)
+    if not ok:
+        await _inv_reply(ws_id, save, err)
+        return
+    # 移动语义：同一件装饰品不能同时占两个槽
+    for k in INV_EQUIP_SLOTS:
+        if save.get(k) == item_id:
+            save[k] = ""
+    save[slot] = item_id
+    if not _write_save(pid, save):
+        await _inv_reply(ws_id, cloud_load(pid), "save_failed")
+        return
+    print(f"[INV] {pid} 装备 {item_id} → {slot}", flush=True)
+    await _inv_reply(ws_id, save)
+
+
+async def on_inv_unequip(ws_id: str, msg: dict):
+    pid = _inv_pid(ws_id)
+    if not pid:
+        await send(ws_id, pack(type="inv_state", data={}, error="no_auth"))
+        return
+    slot = str(msg.get("slot") or "")
+    save = cloud_load(pid)
+    if slot not in INV_EQUIP_SLOTS:
+        await _inv_reply(ws_id, save, "bad_slot")
+        return
+    save[slot] = ""
+    if slot == "nest":
+        save["equip_nest"] = ""
+    if not _write_save(pid, save):
+        await _inv_reply(ws_id, cloud_load(pid), "save_failed")
+        return
+    await _inv_reply(ws_id, save)
+
+
 async def on_disband_room(ws_id: str, msg: dict):
     """★ 2026-10-20：房主**显式解散**房间。
 
@@ -1387,6 +1763,14 @@ HANDLERS = {
     "disband_room":  lambda ws_id, msg: on_disband_room(ws_id, msg),
     # ★ 2026-10-20：一局正常打完 → 房间回大厅（否则永远卡在 in_game）
     "game_over":     lambda ws_id, msg: on_game_over(ws_id, msg),
+    # ★ 2026-10-22：权威向服务端要本房真人的**装备 ID**（首饰暴击校验）
+    "crit_stats_request": lambda ws_id, msg: on_crit_stats_request(ws_id, msg),
+    # ★ 2026-10-23 Phase 1：服务端资产 —— 仓库/装备的唯一写入口
+    "inv_shop_buy": lambda ws_id, msg: on_inv_shop_buy(ws_id, msg),
+    "inv_add":      lambda ws_id, msg: on_inv_add(ws_id, msg),
+    "inv_remove":   lambda ws_id, msg: on_inv_remove(ws_id, msg),
+    "inv_equip":    lambda ws_id, msg: on_inv_equip(ws_id, msg),
+    "inv_unequip":  lambda ws_id, msg: on_inv_unequip(ws_id, msg),
     # S8：对局消息 —— 客户端↔权威。三条的收信人各不相同，服务端逐条查权限
     "identity_action":  lambda ws_id, msg: on_identity_action(ws_id, msg),
     "identity_state":   lambda ws_id, msg: on_identity_state(ws_id, msg),
@@ -1995,11 +2379,9 @@ async def on_gm_give(ws_id: str, msg: dict):
         save["coins"] = coins
         detail = f"+{amount:,} 金币 (当前 {coins:,})"
     elif gtype == "item":
-        owned = save.get("owned_items", "")
-        owned_list = owned.split(",") if owned else []
-        if item_id not in owned_list:
-            owned_list.append(item_id)
-        save["owned_items"] = ",".join(owned_list)
+        owned = parse_owned(save.get("owned_items", ""))
+        owned[item_id] = owned.get(item_id, 0) + 1
+        save["owned_items"] = fmt_owned(owned)
         detail = f"获得物品 {item_id}"
 
     cloud_save(pid, save, skip_check=True)
