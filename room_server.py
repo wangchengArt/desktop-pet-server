@@ -159,6 +159,11 @@ def _save_coin_audit(token: str, audit: dict):
 # （用户 2026-10-23 选的口径）。
 SERVER_INV_KEYS = ("owned_items", "skin_chick", "skin_luobo",
                    "nest", "equip_nest", "deco_1", "deco_2", "deco_3")
+# 服务端元数据：**只由服务端写**，客户端上传时一律保留服务端旧值。
+# `inv_seeded` = 这个账号的仓库已经落定过（迁移过 / 已经有过仓库）。
+# ⚠️ 必须和 `SERVER_INV_KEYS` 一样在 `cloud_save` 里保留 —— 否则一次
+#    普通上传（本地档案里没有这个键）就会把它抹掉，迁移又变成可以反复采纳。
+SERVER_META_KEYS = ("inv_seeded",)
 INV_EQUIP_SLOTS = ("skin_chick", "skin_luobo", "nest",
                    "deco_1", "deco_2", "deco_3")
 # 允许客户端上报的产出来源（服务端只校验「物品 ID 存在」，不跑 RNG/奖池；
@@ -256,7 +261,55 @@ def cloud_save(token: str, data: dict, skip_check: bool = False) -> bool:
     """
     old = cloud_load(token)
     if not skip_check:
-        for k in SERVER_INV_KEYS:
+        # ★ 2026-10-23 兼容旧客户端：Phase 1 上线后，老客户端仍会把本地仓库
+        #   随 `sync_upload` 一起发上来。如果服务端从未落定过仓库
+        #   （没有 `inv_seeded`、也没有非空 `owned_items`），就把这一次上传的
+        #   仓库/装备**一次性采纳**，然后落 `inv_seeded`。
+        #
+        #   为什么必须做：老客户端登录时先 `_clear_save_data()`，再从服务端拉；
+        #   服务端没有仓库 → 本地仓库直接丢。新客户端走的是 `inv_migrate`
+        #   （同一条一次性语义），但老客户端不会发那条消息。
+        #
+        #   安全边界与 `on_inv_migrate` 相同：Phase 1 本来就接受客户端上报的
+        #   产出；这里只是把同一次性的窗口也开放给旧客户端。
+        if (not int(old.get("inv_seeded", 0) or 0)
+                and not parse_owned(old.get("owned_items", ""))):
+            _up_owned = parse_owned(data.get("owned_items", ""))
+            if _up_owned:
+                if ITEM_CATALOG:
+                    _clean = {iid: q for iid, q in _up_owned.items()
+                              if iid in ITEM_CATALOG and 1 <= q <= INV_QTY_MAX}
+                    _eq = {}
+                    for slot in INV_EQUIP_SLOTS:
+                        iid = str(data.get(slot, "") or "")
+                        if slot == "nest" and not iid:
+                            iid = str(data.get("equip_nest", "") or "")
+                        if (iid and _clean.get(iid, 0) > 0
+                                and _equip_slot_for(iid, slot)[0]):
+                            _eq[slot] = iid
+                else:
+                    # 目录缺失时只能采纳仓库，装备一律不采纳（无法校验类别）
+                    _clean = {iid: q for iid, q in _up_owned.items()
+                              if 1 <= q <= INV_QTY_MAX}
+                    _eq = {}
+                if _clean:
+                    data["owned_items"] = fmt_owned(_clean)
+                    for slot in INV_EQUIP_SLOTS:
+                        data[slot] = _eq.get(slot, "")
+                    data["equip_nest"] = _eq.get("nest", "")
+                    data["inv_seeded"] = 1
+                    # 让下面的「保留服务端旧值」循环看到采纳后的值
+                    old["owned_items"] = data["owned_items"]
+                    for slot in INV_EQUIP_SLOTS:
+                        old[slot] = data[slot]
+                    old["equip_nest"] = data["equip_nest"]
+                    old["inv_seeded"] = 1
+                    print(f"[INV] {token} 旧客户端首次上传：采纳仓库 "
+                          f"{len(_clean)} 种 / 装备 {len(_eq)} 槽", flush=True)
+                else:
+                    print(f"[INV] {token} 旧客户端上传的仓库全部不在目录里，"
+                          f"不采纳（保留再次采纳的窗口）", flush=True)
+        for k in SERVER_INV_KEYS + SERVER_META_KEYS:
             if k in old:
                 data[k] = old[k]
             else:
@@ -1224,17 +1277,29 @@ async def on_inv_migrate(ws_id: str, msg: dict):
     """★ 2026-10-23：服务端账本上线时的一次性迁移。
 
     背景：Phase 1 之前仓库只存在客户端；登录会 `_clear_save_data()` 清本地。
-    同一账号重登时，客户端在清空前把本地仓库发来；**只有服务端那份存档还
-    没有 `owned_items` 时**才采纳（老账号），否则以服务端为准（新客户端之后的
-    账号）。不同账号绝不会走到这里（客户端按 player_id 判断）。
+    同一账号重登时，客户端在清空前把本地仓库发来做**一次性采纳**。
+
+    ★ 判据是 `inv_seeded`，**不是**「服务端 `owned_items` 是否非空」。
+      旧实现只看后者：如果迁移时本地仓库恰好为空，服务端 `owned_items`
+      仍然是空串，下次登录就会再次采纳 —— 「一次性」形同虚设。
+      现在只要迁移成功（哪怕内容为空）就落 `inv_seeded=1`，之后一律拒绝。
+      兼容 Phase 1 早期已经由商城/产出写入过仓库、但没有标记的账号：
+      见到非空仓库时补写一次标记。
     """
     pid = _inv_pid(ws_id)
     if not pid:
         await send(ws_id, pack(type="inv_migrated", ok=False, msg="no_auth"))
         return
     save = cloud_load(pid)
+    if int(save.get("inv_seeded", 0) or 0):
+        # 已经落定过 → 不采纳本地（在线以服务端为准）
+        await send(ws_id, pack(type="inv_migrated", ok=True, migrated=False))
+        return
     if parse_owned(save.get("owned_items", "")):
-        # 服务端已经有仓库 → 不采纳本地（在线以服务端为准）
+        # 兼容旧账号：仓库已经有东西但缺标记 → 补上，避免以后清空后又被采纳
+        save["inv_seeded"] = 1
+        if not _write_save(pid, save):
+            print(f"[INV] {pid} 补写 inv_seeded 失败（不影响本次）", flush=True)
         await send(ws_id, pack(type="inv_migrated", ok=True, migrated=False))
         return
     if not ITEM_CATALOG:
