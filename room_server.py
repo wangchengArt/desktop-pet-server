@@ -1220,6 +1220,52 @@ def _equip_slot_for(item_id: str, slot: str):
     return True, ""
 
 
+async def on_inv_migrate(ws_id: str, msg: dict):
+    """★ 2026-10-23：服务端账本上线时的一次性迁移。
+
+    背景：Phase 1 之前仓库只存在客户端；登录会 `_clear_save_data()` 清本地。
+    同一账号重登时，客户端在清空前把本地仓库发来；**只有服务端那份存档还
+    没有 `owned_items` 时**才采纳（老账号），否则以服务端为准（新客户端之后的
+    账号）。不同账号绝不会走到这里（客户端按 player_id 判断）。
+    """
+    pid = _inv_pid(ws_id)
+    if not pid:
+        await send(ws_id, pack(type="inv_migrated", ok=False, msg="no_auth"))
+        return
+    save = cloud_load(pid)
+    if parse_owned(save.get("owned_items", "")):
+        # 服务端已经有仓库 → 不采纳本地（在线以服务端为准）
+        await send(ws_id, pack(type="inv_migrated", ok=True, migrated=False))
+        return
+    if not ITEM_CATALOG:
+        await send(ws_id, pack(type="inv_migrated", ok=False,
+                               msg="catalog_missing"))
+        return
+    owned = {}
+    for iid, qty in parse_owned(msg.get("owned_items", "")).items():
+        if iid in ITEM_CATALOG and 1 <= qty <= INV_QTY_MAX:
+            owned[iid] = qty
+    equipped = msg.get("equipped") or {}
+    eq_out = {}
+    for slot in INV_EQUIP_SLOTS:
+        iid = str(equipped.get(slot, "") or "")
+        if iid and owned.get(iid, 0) > 0 and _equip_slot_for(iid, slot)[0]:
+            eq_out[slot] = iid
+    save["owned_items"] = fmt_owned(owned)
+    for slot in INV_EQUIP_SLOTS:
+        save[slot] = ""
+    save.update(eq_out)
+    save["inv_seeded"] = 1
+    if not _write_save(pid, save):
+        await send(ws_id, pack(type="inv_migrated", ok=False,
+                               msg="save_failed"))
+        return
+    print(f"[INV] {pid} 一次性迁移仓库 {len(owned)} 种 / "
+          f"装备 {len(eq_out)} 槽", flush=True)
+    await send(ws_id, pack(type="inv_migrated", ok=True, migrated=True,
+                           n=len(owned)))
+
+
 async def on_inv_shop_buy(ws_id: str, msg: dict):
     """商城购买：服务端扣金币 + 加物品（唯一付费入口）。"""
     pid = _inv_pid(ws_id)
@@ -1766,6 +1812,7 @@ HANDLERS = {
     # ★ 2026-10-22：权威向服务端要本房真人的**装备 ID**（首饰暴击校验）
     "crit_stats_request": lambda ws_id, msg: on_crit_stats_request(ws_id, msg),
     # ★ 2026-10-23 Phase 1：服务端资产 —— 仓库/装备的唯一写入口
+    "inv_migrate":  lambda ws_id, msg: on_inv_migrate(ws_id, msg),
     "inv_shop_buy": lambda ws_id, msg: on_inv_shop_buy(ws_id, msg),
     "inv_add":      lambda ws_id, msg: on_inv_add(ws_id, msg),
     "inv_remove":   lambda ws_id, msg: on_inv_remove(ws_id, msg),
